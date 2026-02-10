@@ -30,7 +30,7 @@ def parse_allowed_ids(raw_value: str):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    token = os.getenv("POWERON_BOT_TOKEN") or load_token_from_file("../poweron_bot_token.txt")
+    token = os.getenv("POWERON_BOT_TOKEN") or load_token_from_file("poweron_bot_token.txt")
     if not token:
         raise RuntimeError("Set POWERON_BOT_TOKEN or create poweron_bot_token.txt")
 
