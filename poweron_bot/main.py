@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import sys
+import threading
 import time
 
 import telebot
@@ -57,6 +59,8 @@ def admin_keyboard() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton("📊 /stats", callback_data="admin:stats"))
     kb.add(types.InlineKeyboardButton("🩺 /health", callback_data="admin:health"))
     kb.add(types.InlineKeyboardButton("📣 /broadcast", callback_data="admin:broadcast"))
+    kb.add(types.InlineKeyboardButton("🛑 /shutdown", callback_data="admin:shutdown"))
+    kb.add(types.InlineKeyboardButton("🔄 /restart", callback_data="admin:restart"))
     return kb
 
 
@@ -95,6 +99,19 @@ def main():
             f"• Активних автооновлень: {active_auto}\n"
             f"• Поточних in-memory станів: {len(wizard.state)}"
         )
+
+
+    def schedule_shutdown():
+        def _stop():
+            os._exit(0)
+
+        threading.Timer(1.0, _stop).start()
+
+    def schedule_restart():
+        def _restart():
+            os.execv(sys.executable, [sys.executable, "-m", "poweron_bot.main"])
+
+        threading.Timer(1.0, _restart).start()
 
     def build_health_text() -> str:
         api_ok = False
@@ -156,6 +173,20 @@ def main():
         admin_broadcast_pending.add(message.chat.id)
         bot.send_message(message.chat.id, "📣 Введіть текст для розсилки всім користувачам:")
 
+    @bot.message_handler(commands=["shutdown"])
+    def cmd_shutdown(message):
+        if not is_admin(message.from_user.id):
+            return
+        bot.send_message(message.chat.id, "🛑 Сервер буде зупинено через 1 секунду.")
+        schedule_shutdown()
+
+    @bot.message_handler(commands=["restart"])
+    def cmd_restart(message):
+        if not is_admin(message.from_user.id):
+            return
+        bot.send_message(message.chat.id, "🔄 Перезапуск сервера через 1 секунду.")
+        schedule_restart()
+
     @bot.message_handler(func=lambda m: True)
     def on_message(message):
         if not is_allowed(message):
@@ -203,6 +234,14 @@ def main():
         if call.data == "admin:broadcast" and is_admin(call.from_user.id):
             admin_broadcast_pending.add(call.message.chat.id)
             bot.send_message(call.message.chat.id, "📣 Введіть текст для розсилки всім користувачам:")
+            return
+        if call.data == "admin:shutdown" and is_admin(call.from_user.id):
+            bot.send_message(call.message.chat.id, "🛑 Сервер буде зупинено через 1 секунду.")
+            schedule_shutdown()
+            return
+        if call.data == "admin:restart" and is_admin(call.from_user.id):
+            bot.send_message(call.message.chat.id, "🔄 Перезапуск сервера через 1 секунду.")
+            schedule_restart()
             return
 
         if wizard.handle_callback(call):
