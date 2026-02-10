@@ -73,8 +73,9 @@ class PowerOnWizard:
         return kb
 
     def _home_keyboard(self):
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
         kb.add(types.KeyboardButton("💡 Графік світла (за адресою)"))
+        kb.add(types.KeyboardButton("🏠 Головна"))
         return kb
 
     @staticmethod
@@ -174,10 +175,17 @@ class PowerOnWizard:
         chat_id = message.chat.id
         session = self.state.get(chat_id)
         text = (message.text or "").strip()
+
+        if text == "💡 Графік світла (за адресою)":
+            self.start(chat_id)
+            return True
+
+        if text == "🏠 Головна":
+            self.state.pop(chat_id, None)
+            self.send_home(chat_id)
+            return True
+
         if not session:
-            if text == "💡 Графік світла (за адресою)":
-                self.start(chat_id)
-                return True
             return False
 
         min_len = 1 if session.get("step") == "house_query" else 2
