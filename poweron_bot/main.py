@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 import telebot
 
@@ -88,7 +89,13 @@ def main():
         if wizard.handle_callback(call):
             return
 
-    bot.infinity_polling(skip_pending=True)
+    retry_delay_seconds = 5
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True)
+        except Exception as exc:
+            logging.exception("Bot polling crashed, restarting in %s seconds. error=%s", retry_delay_seconds, exc)
+            time.sleep(retry_delay_seconds)
 
 
 if __name__ == "__main__":
