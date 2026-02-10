@@ -27,6 +27,15 @@ def parse_allowed_ids(raw_value: str):
             continue
     return ids
 
+def parse_admin_id(raw_value: str):
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
 
 def setup_user_logger() -> logging.Logger:
     os.makedirs("logs", exist_ok=True)
@@ -48,14 +57,17 @@ def main():
         raise RuntimeError("Set POWERON_BOT_TOKEN or create poweron_bot_token.txt")
 
     allowed_ids = parse_allowed_ids(os.getenv("POWERON_ALLOWED_IDS", ""))
+    admin_user_id = parse_admin_id(os.getenv("POWERON_ADMIN_USER_ID", ""))
     bot = telebot.TeleBot(token)
     wizard = PowerOnWizard(bot)
     user_logger = setup_user_logger()
 
     def is_allowed(message):
+        user_id = getattr(message.from_user, "id", None)
+        if admin_user_id is not None:
+            return user_id == admin_user_id
         if not allowed_ids:
             return True
-        user_id = getattr(message.from_user, "id", None)
         return user_id in allowed_ids
 
     @bot.message_handler(commands=["start"])
@@ -84,7 +96,9 @@ def main():
 
     @bot.callback_query_handler(func=lambda call: True)
     def on_callback(call):
-        if allowed_ids and call.from_user.id not in allowed_ids:
+        if admin_user_id is not None and call.from_user.id != admin_user_id:
+            return
+        if admin_user_id is None and allowed_ids and call.from_user.id not in allowed_ids:
             return
         if wizard.handle_callback(call):
             return
