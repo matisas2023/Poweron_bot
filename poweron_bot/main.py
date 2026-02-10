@@ -78,11 +78,9 @@ def main():
 
     def is_allowed(message):
         user_id = getattr(message.from_user, "id", None)
-        if admin_user_id is not None:
-            return user_id == admin_user_id
-        if not allowed_ids:
-            return True
-        return user_id in allowed_ids
+        if allowed_ids:
+            return user_id in allowed_ids
+        return True
 
     def is_admin(user_id: int) -> bool:
         return admin_user_id is not None and user_id == admin_user_id
@@ -130,6 +128,8 @@ def main():
             bot.send_message(message.chat.id, "⛔️ Доступ заборонено")
             return
         wizard.send_home(message.chat.id)
+        if is_admin(message.from_user.id):
+            bot.send_message(message.chat.id, "🛠 Адмін-меню:", reply_markup=admin_keyboard())
 
     @bot.message_handler(commands=["admin"])
     def cmd_admin(message):
@@ -159,6 +159,7 @@ def main():
     @bot.message_handler(func=lambda m: True)
     def on_message(message):
         if not is_allowed(message):
+            bot.send_message(message.chat.id, "⛔️ Доступ заборонено")
             return
 
         if is_admin(message.from_user.id) and message.chat.id in admin_broadcast_pending:
@@ -190,9 +191,7 @@ def main():
 
     @bot.callback_query_handler(func=lambda call: True)
     def on_callback(call):
-        if admin_user_id is not None and call.from_user.id != admin_user_id:
-            return
-        if admin_user_id is None and allowed_ids and call.from_user.id not in allowed_ids:
+        if allowed_ids and call.from_user.id not in allowed_ids:
             return
 
         if call.data == "admin:stats" and is_admin(call.from_user.id):
