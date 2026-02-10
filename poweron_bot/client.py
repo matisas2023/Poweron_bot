@@ -3,7 +3,7 @@ import hashlib
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 
@@ -27,7 +27,21 @@ class PowerOnClient:
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
         self._cache: Dict[str, CacheRecord] = {}
-        self._locks: Dict[str, asyncio.Lock] = {}
+        self._locks: Dict[str, Tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
+
+    def _get_lock_for_current_loop(self, cache_key: str) -> asyncio.Lock:
+        current_loop = asyncio.get_running_loop()
+        lock_record = self._locks.get(cache_key)
+        if not lock_record:
+            lock = asyncio.Lock()
+            self._locks[cache_key] = (current_loop, lock)
+            return lock
+
+        lock_loop, lock = lock_record
+        if lock_loop is not current_loop:
+            lock = asyncio.Lock()
+            self._locks[cache_key] = (current_loop, lock)
+        return lock
 
     async def _get_json(self, path: str, params: Optional[dict] = None) -> dict:
         async with httpx.AsyncClient(base_url=BASE_API_URL, timeout=30.0) as client:
@@ -106,7 +120,7 @@ class PowerOnClient:
         if cached and cached.expires_at > now and os.path.exists(cached.path):
             return cached.path
 
-        lock = self._locks.setdefault(cache_key, asyncio.Lock())
+        lock = self._get_lock_for_current_loop(cache_key)
         async with lock:
             cached = self._cache.get(cache_key)
             if cached and cached.expires_at > now and os.path.exists(cached.path):
