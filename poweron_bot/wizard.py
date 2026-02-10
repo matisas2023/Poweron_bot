@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import threading
+import time
 from typing import Dict, Optional
 
 from telebot import types
@@ -18,9 +20,12 @@ class PowerOnWizard:
         self.history: Dict[int, list] = {}
         self.pinned: Dict[int, list] = {}
         self.seen_users = set()
+        self.auto_update: Dict[int, dict] = {}
         self.user_data_file = "data/users.json"
         os.makedirs("data", exist_ok=True)
         self._users_payload = {}
+        self._auto_update_worker_started = False
+        self._start_auto_update_worker()
 
     def _load_users_payload(self):
         if self._users_payload:
@@ -43,6 +48,56 @@ class PowerOnWizard:
         except Exception as exc:
             self.logger.exception("poweron.user_data_save_failed error=%s", exc)
 
+    def _hydrate_users_cache_from_payload(self):
+        self._load_users_payload()
+        for chat_key, user_payload in self._users_payload.items():
+            try:
+                chat_id = int(chat_key)
+            except (TypeError, ValueError):
+                continue
+            self.history[chat_id] = user_payload.get("history", [])[:3]
+            self.pinned[chat_id] = user_payload.get("pinned", [])[:3]
+            auto_update = user_payload.get("auto_update") or {}
+            interval = int(auto_update.get("interval", 60) or 60)
+            self.auto_update[chat_id] = {
+                "enabled": bool(auto_update.get("enabled", False)),
+                "interval": max(10, interval),
+                "next_run_ts": float(auto_update.get("next_run_ts", 0) or 0),
+            }
+            if user_payload.get("seen"):
+                self.seen_users.add(chat_id)
+
+    def _start_auto_update_worker(self):
+        if self._auto_update_worker_started:
+            return
+        self._hydrate_users_cache_from_payload()
+        self._auto_update_worker_started = True
+        worker = threading.Thread(target=self._auto_update_loop, name="poweron-auto-update", daemon=True)
+        worker.start()
+
+    def _auto_update_loop(self):
+        while True:
+            time.sleep(1)
+            for chat_id, settings in list(self.auto_update.items()):
+                if not settings.get("enabled"):
+                    continue
+                interval = int(settings.get("interval", 60) or 60)
+                if interval < 10:
+                    interval = 10
+                next_run_ts = float(settings.get("next_run_ts", 0) or 0)
+                now = time.time()
+                if now < next_run_ts:
+                    continue
+                history = self.history.get(chat_id, [])
+                if not history:
+                    continue
+                try:
+                    settings["next_run_ts"] = now + interval
+                    self._send_schedule(chat_id, history[0], show_wait=False)
+                    self._save_user_data(chat_id)
+                except Exception as exc:
+                    self.logger.exception("poweron.auto_update_failed chat_id=%s error=%s", chat_id, exc)
+
     def _save_user_data(self, chat_id: int):
         self._load_users_payload()
         payload_key = str(chat_id)
@@ -50,16 +105,24 @@ class PowerOnWizard:
             "seen": chat_id in self.seen_users,
             "history": self.history.get(chat_id, [])[:3],
             "pinned": self.pinned.get(chat_id, [])[:3],
+            "auto_update": self.auto_update.get(chat_id, {"enabled": False, "interval": 60, "next_run_ts": 0}),
         }
         self._save_users_payload()
 
     def _ensure_user_loaded(self, chat_id: int):
-        if chat_id in self.history and chat_id in self.pinned:
+        if chat_id in self.history and chat_id in self.pinned and chat_id in self.auto_update:
             return
         self._load_users_payload()
         user_payload = self._users_payload.get(str(chat_id), {})
         self.history[chat_id] = user_payload.get("history", [])[:3]
         self.pinned[chat_id] = user_payload.get("pinned", [])[:3]
+        auto_update = user_payload.get("auto_update") or {}
+        interval = int(auto_update.get("interval", 60) or 60)
+        self.auto_update[chat_id] = {
+            "enabled": bool(auto_update.get("enabled", False)),
+            "interval": max(10, interval),
+            "next_run_ts": float(auto_update.get("next_run_ts", 0) or 0),
+        }
         if user_payload.get("seen"):
             self.seen_users.add(chat_id)
 
@@ -95,6 +158,7 @@ class PowerOnWizard:
             kb.add(types.InlineKeyboardButton(f"📌 {self._address_caption(item)}", callback_data=f"poweron:pin_open:{idx}"))
         if history:
             kb.add(types.InlineKeyboardButton("🕘 Історія (останні 3)", callback_data="poweron:history"))
+        kb.add(types.InlineKeyboardButton("⚙️ Автооновлення", callback_data="poweron:auto_settings"))
         return kb
 
     def _history_keyboard(self, chat_id: int) -> Optional[types.InlineKeyboardMarkup]:
@@ -231,6 +295,26 @@ class PowerOnWizard:
 
         return False
 
+    def _auto_update_settings_keyboard(self, chat_id: int) -> types.InlineKeyboardMarkup:
+        self._ensure_user_loaded(chat_id)
+        settings = self.auto_update.get(chat_id, {"enabled": False, "interval": 60})
+        current_interval = int(settings.get("interval", 60) or 60)
+
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        status = "✅ Увімкнено" if settings.get("enabled") else "⛔️ Вимкнено"
+        kb.add(types.InlineKeyboardButton(f"Статус: {status}", callback_data="poweron:auto_status"))
+        kb.add(types.InlineKeyboardButton("Увімкнути", callback_data=f"poweron:auto_on:{current_interval}"))
+        kb.add(types.InlineKeyboardButton("Вимкнути", callback_data="poweron:auto_off"))
+        kb.add(
+            types.InlineKeyboardButton("30с", callback_data="poweron:auto_on:30"),
+            types.InlineKeyboardButton("60с", callback_data="poweron:auto_on:60"),
+        )
+        kb.add(types.InlineKeyboardButton("120с", callback_data="poweron:auto_on:120"))
+        nav = self._nav_keyboard()
+        for row in nav.keyboard:
+            kb.keyboard.append(row)
+        return kb
+
     def handle_callback(self, call) -> bool:
         data = call.data or ""
         if not data.startswith("poweron:"):
@@ -256,8 +340,35 @@ class PowerOnWizard:
                 return True
             self.bot.send_message(chat_id, "🕘 Останні 3 адреси. Можна відкрити або закріпити:", reply_markup=history_kb)
             return True
+        if data == "poweron:auto_settings":
+            self.bot.send_message(chat_id, "⚙️ Налаштування автооновлення графіка:", reply_markup=self._auto_update_settings_keyboard(chat_id))
+            return True
+        if data == "poweron:auto_status":
+            self.bot.send_message(chat_id, "Оберіть режим автооновлення:", reply_markup=self._auto_update_settings_keyboard(chat_id))
+            return True
+        if data == "poweron:auto_off":
+            self._ensure_user_loaded(chat_id)
+            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "next_run_ts": 0})
+            settings["enabled"] = False
+            settings["next_run_ts"] = 0
+            self._save_user_data(chat_id)
+            self.bot.send_message(chat_id, "⛔️ Автооновлення вимкнено.", reply_markup=self._auto_update_settings_keyboard(chat_id))
+            return True
 
         try:
+            if data.startswith("poweron:auto_on:"):
+                interval = int(data.rsplit(":", 1)[1])
+                if interval < 10:
+                    interval = 10
+                self._ensure_user_loaded(chat_id)
+                settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "next_run_ts": 0})
+                settings["enabled"] = True
+                settings["interval"] = interval
+                settings["next_run_ts"] = time.time() + interval
+                self._save_user_data(chat_id)
+                self.bot.send_message(chat_id, f"✅ Автооновлення увімкнено: кожні {interval} секунд.", reply_markup=self._auto_update_settings_keyboard(chat_id))
+                return True
+
             if data.startswith("poweron:set:"):
                 settlement = (session.get("settlements") or {}).get(data.split(":", 2)[2])
                 if not settlement:
@@ -331,7 +442,7 @@ class PowerOnWizard:
             return
         self.start(chat_id)
 
-    def _send_schedule(self, chat_id: int, address_item: Optional[dict] = None):
+    def _send_schedule(self, chat_id: int, address_item: Optional[dict] = None, show_wait: bool = True):
         session = self.state.get(chat_id)
         if not session and not address_item:
             return
@@ -357,7 +468,8 @@ class PowerOnWizard:
             schedule = house.get("schedule", {})
 
         try:
-            self.bot.send_message(chat_id, "⏳ Очікуйте, формую та завантажую графік...")
+            if show_wait:
+                self.bot.send_message(chat_id, "⏳ Очікуйте, формую та завантажую графік...")
             image_path = asyncio.run(self.client.render_schedule_screenshot(settlement_render, street_name, house_name, cache_key))
             with open(image_path, "rb") as image_file:
                 self.bot.send_photo(chat_id, image_file, caption=f"Графік відключень для: {settlement_display}, {street_name}, {house_name} (джерело: poweron.toe.com.ua)")
