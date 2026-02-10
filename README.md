@@ -10,6 +10,7 @@
 - Історія останніх 3 адрес.
 - Закріплення до 3 адрес для швидкого доступу.
 - Екран **⚙️ Налаштування** з керуванням автооновленням.
+- Адмін-меню з командами `/stats`, `/broadcast`, `/health` (лише для адміна).
 - Логування входів користувачів у `logs/user_entries.log`.
 - При критичній помилці polling бот автоматично перезапускається з паузою 5 секунд.
 - Збереження персональних налаштувань (історія/закріплені адреси) у `data/users.json (ключі — chat_id)`, включно з `auto_update` (enabled/interval/silent).
@@ -25,6 +26,7 @@
 │   ├── client.py
 │   ├── main.py
 │   └── wizard.py
+├── poweron_admin_user_id.txt.example
 ├── poweron_bot_token.txt.example
 ├── requirements.txt
 └── README.md
