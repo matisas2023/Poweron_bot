@@ -5,4 +5,4 @@ tmp/
 __pycache__/
 *.pyc
 logs/
-data/users/
+data/users.json

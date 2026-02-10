@@ -18,48 +18,50 @@ class PowerOnWizard:
         self.history: Dict[int, list] = {}
         self.pinned: Dict[int, list] = {}
         self.seen_users = set()
-        self.user_data_dir = "data/users"
-        os.makedirs(self.user_data_dir, exist_ok=True)
+        self.user_data_file = "data/users.json"
+        os.makedirs("data", exist_ok=True)
+        self._users_payload = {}
 
-    def _user_file_path(self, chat_id: int) -> str:
-        return os.path.join(self.user_data_dir, f"{chat_id}.json")
-
-    def _load_user_data(self, chat_id: int):
-        path = self._user_file_path(chat_id)
-        if not os.path.exists(path):
-            self.history.setdefault(chat_id, [])
-            self.pinned.setdefault(chat_id, [])
+    def _load_users_payload(self):
+        if self._users_payload:
             return
-
+        if not os.path.exists(self.user_data_file):
+            self._users_payload = {}
+            return
         try:
-            with open(path, "r", encoding="utf-8") as user_file:
-                payload = json.load(user_file)
-            self.history[chat_id] = payload.get("history", [])[:3]
-            self.pinned[chat_id] = payload.get("pinned", [])[:3]
-            if payload.get("seen"):
-                self.seen_users.add(chat_id)
+            with open(self.user_data_file, "r", encoding="utf-8") as users_file:
+                payload = json.load(users_file)
+            self._users_payload = payload if isinstance(payload, dict) else {}
         except Exception as exc:
-            self.logger.exception("poweron.user_data_load_failed chat_id=%s error=%s", chat_id, exc)
-            self.history.setdefault(chat_id, [])
-            self.pinned.setdefault(chat_id, [])
+            self.logger.exception("poweron.user_data_load_failed error=%s", exc)
+            self._users_payload = {}
+
+    def _save_users_payload(self):
+        try:
+            with open(self.user_data_file, "w", encoding="utf-8") as users_file:
+                json.dump(self._users_payload, users_file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            self.logger.exception("poweron.user_data_save_failed error=%s", exc)
 
     def _save_user_data(self, chat_id: int):
-        path = self._user_file_path(chat_id)
-        payload = {
+        self._load_users_payload()
+        payload_key = str(chat_id)
+        self._users_payload[payload_key] = {
             "seen": chat_id in self.seen_users,
             "history": self.history.get(chat_id, [])[:3],
             "pinned": self.pinned.get(chat_id, [])[:3],
         }
-        try:
-            with open(path, "w", encoding="utf-8") as user_file:
-                json.dump(payload, user_file, ensure_ascii=False, indent=2)
-        except Exception as exc:
-            self.logger.exception("poweron.user_data_save_failed chat_id=%s error=%s", chat_id, exc)
+        self._save_users_payload()
 
     def _ensure_user_loaded(self, chat_id: int):
         if chat_id in self.history and chat_id in self.pinned:
             return
-        self._load_user_data(chat_id)
+        self._load_users_payload()
+        user_payload = self._users_payload.get(str(chat_id), {})
+        self.history[chat_id] = user_payload.get("history", [])[:3]
+        self.pinned[chat_id] = user_payload.get("pinned", [])[:3]
+        if user_payload.get("seen"):
+            self.seen_users.add(chat_id)
 
     def _nav_keyboard(self) -> types.InlineKeyboardMarkup:
         kb = types.InlineKeyboardMarkup(row_width=3)
