@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import os
 from typing import Dict, Optional
 
 from telebot import types
@@ -16,6 +18,48 @@ class PowerOnWizard:
         self.history: Dict[int, list] = {}
         self.pinned: Dict[int, list] = {}
         self.seen_users = set()
+        self.user_data_dir = "data/users"
+        os.makedirs(self.user_data_dir, exist_ok=True)
+
+    def _user_file_path(self, chat_id: int) -> str:
+        return os.path.join(self.user_data_dir, f"{chat_id}.json")
+
+    def _load_user_data(self, chat_id: int):
+        path = self._user_file_path(chat_id)
+        if not os.path.exists(path):
+            self.history.setdefault(chat_id, [])
+            self.pinned.setdefault(chat_id, [])
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as user_file:
+                payload = json.load(user_file)
+            self.history[chat_id] = payload.get("history", [])[:3]
+            self.pinned[chat_id] = payload.get("pinned", [])[:3]
+            if payload.get("seen"):
+                self.seen_users.add(chat_id)
+        except Exception as exc:
+            self.logger.exception("poweron.user_data_load_failed chat_id=%s error=%s", chat_id, exc)
+            self.history.setdefault(chat_id, [])
+            self.pinned.setdefault(chat_id, [])
+
+    def _save_user_data(self, chat_id: int):
+        path = self._user_file_path(chat_id)
+        payload = {
+            "seen": chat_id in self.seen_users,
+            "history": self.history.get(chat_id, [])[:3],
+            "pinned": self.pinned.get(chat_id, [])[:3],
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as user_file:
+                json.dump(payload, user_file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            self.logger.exception("poweron.user_data_save_failed chat_id=%s error=%s", chat_id, exc)
+
+    def _ensure_user_loaded(self, chat_id: int):
+        if chat_id in self.history and chat_id in self.pinned:
+            return
+        self._load_user_data(chat_id)
 
     def _nav_keyboard(self) -> types.InlineKeyboardMarkup:
         kb = types.InlineKeyboardMarkup(row_width=3)
@@ -37,6 +81,7 @@ class PowerOnWizard:
         return f"{settlement_name}, {item['street_name']}, {item['house_name']}"
 
     def _quick_access_keyboard(self, chat_id: int) -> Optional[types.InlineKeyboardMarkup]:
+        self._ensure_user_loaded(chat_id)
         pinned = self.pinned.get(chat_id, [])
         history = self.history.get(chat_id, [])
         if not pinned and not history:
@@ -50,6 +95,7 @@ class PowerOnWizard:
         return kb
 
     def _history_keyboard(self, chat_id: int) -> Optional[types.InlineKeyboardMarkup]:
+        self._ensure_user_loaded(chat_id)
         history = self.history.get(chat_id, [])
         if not history:
             return None
@@ -77,25 +123,32 @@ class PowerOnWizard:
         return kb
 
     def _upsert_history(self, chat_id: int, item: dict):
+        self._ensure_user_loaded(chat_id)
         history = self.history.setdefault(chat_id, [])
         history = [entry for entry in history if entry["cache_key"] != item["cache_key"]]
         history.insert(0, item)
         self.history[chat_id] = history[:3]
+        self._save_user_data(chat_id)
 
     def _toggle_pin(self, chat_id: int, item: dict) -> str:
+        self._ensure_user_loaded(chat_id)
         pinned = self.pinned.setdefault(chat_id, [])
         pinned_keys = {entry["cache_key"] for entry in pinned}
         if item["cache_key"] in pinned_keys:
             self.pinned[chat_id] = [entry for entry in pinned if entry["cache_key"] != item["cache_key"]]
+            self._save_user_data(chat_id)
             return "❌ Адресу відкріплено."
         pinned = [entry for entry in pinned if entry["cache_key"] != item["cache_key"]]
         pinned.insert(0, item)
         self.pinned[chat_id] = pinned[:3]
+        self._save_user_data(chat_id)
         return "📌 Адресу закріплено."
 
     def send_home(self, chat_id: int):
+        self._ensure_user_loaded(chat_id)
         if chat_id not in self.seen_users:
             self.seen_users.add(chat_id)
+            self._save_user_data(chat_id)
             self.bot.send_message(
                 chat_id,
                 """👋 Вітаю! Це бот для перегляду графіків відключень електроенергії за вашою адресою.
@@ -108,6 +161,7 @@ class PowerOnWizard:
         self.bot.send_message(chat_id, "Окремий бот для графіків відключень.", reply_markup=self._home_keyboard())
 
     def start(self, chat_id: int):
+        self._ensure_user_loaded(chat_id)
         self.state[chat_id] = {"step": "settlement_query"}
         extra_kb = self._quick_access_keyboard(chat_id)
         if extra_kb:
