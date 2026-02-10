@@ -27,6 +27,18 @@ def parse_allowed_ids(raw_value: str):
     return ids
 
 
+def setup_user_logger() -> logging.Logger:
+    os.makedirs("logs", exist_ok=True)
+    user_logger = logging.getLogger("poweron_user_entries")
+    user_logger.setLevel(logging.INFO)
+    user_logger.propagate = False
+    if not user_logger.handlers:
+        handler = logging.FileHandler("logs/user_entries.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        user_logger.addHandler(handler)
+    return user_logger
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -37,6 +49,7 @@ def main():
     allowed_ids = parse_allowed_ids(os.getenv("POWERON_ALLOWED_IDS", ""))
     bot = telebot.TeleBot(token)
     wizard = PowerOnWizard(bot)
+    user_logger = setup_user_logger()
 
     def is_allowed(message):
         if not allowed_ids:
@@ -46,6 +59,14 @@ def main():
 
     @bot.message_handler(commands=["start"])
     def cmd_start(message):
+        user = message.from_user
+        user_logger.info(
+            "user_start chat_id=%s user_id=%s username=%s first_name=%s",
+            message.chat.id,
+            getattr(user, "id", None),
+            getattr(user, "username", None),
+            getattr(user, "first_name", None),
+        )
         if not is_allowed(message):
             bot.send_message(message.chat.id, "⛔️ Доступ заборонено")
             return

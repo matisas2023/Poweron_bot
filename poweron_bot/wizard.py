@@ -15,6 +15,7 @@ class PowerOnWizard:
         self.state: Dict[int, dict] = {}
         self.history: Dict[int, list] = {}
         self.pinned: Dict[int, list] = {}
+        self.seen_users = set()
 
     def _nav_keyboard(self) -> types.InlineKeyboardMarkup:
         kb = types.InlineKeyboardMarkup(row_width=3)
@@ -26,8 +27,8 @@ class PowerOnWizard:
         return kb
 
     def _home_keyboard(self):
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("💡 Графік світла (за адресою)", callback_data="poweron:start"))
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.add(types.KeyboardButton("💡 Графік світла (за адресою)"))
         return kb
 
     @staticmethod
@@ -93,6 +94,17 @@ class PowerOnWizard:
         return "📌 Адресу закріплено."
 
     def send_home(self, chat_id: int):
+        if chat_id not in self.seen_users:
+            self.seen_users.add(chat_id)
+            self.bot.send_message(
+                chat_id,
+                """👋 Вітаю! Це бот для перегляду графіків відключень електроенергії за вашою адресою.
+
+Натисніть кнопку нижче, щоб почати пошук.""",
+                reply_markup=self._home_keyboard(),
+            )
+            return
+
         self.bot.send_message(chat_id, "Окремий бот для графіків відключень.", reply_markup=self._home_keyboard())
 
     def start(self, chat_id: int):
@@ -105,10 +117,13 @@ class PowerOnWizard:
     def handle_message(self, message) -> bool:
         chat_id = message.chat.id
         session = self.state.get(chat_id)
+        text = (message.text or "").strip()
         if not session:
+            if text == "💡 Графік світла (за адресою)":
+                self.start(chat_id)
+                return True
             return False
 
-        text = (message.text or "").strip()
         min_len = 1 if session.get("step") == "house_query" else 2
         if len(text) < min_len:
             hint = "1–5" if min_len == 1 else "2–5"
@@ -278,6 +293,7 @@ class PowerOnWizard:
             schedule = house.get("schedule", {})
 
         try:
+            self.bot.send_message(chat_id, "⏳ Очікуйте, формую та завантажую графік...")
             image_path = asyncio.run(self.client.render_schedule_screenshot(settlement_render, street_name, house_name, cache_key))
             with open(image_path, "rb") as image_file:
                 self.bot.send_photo(chat_id, image_file, caption=f"Графік відключень для: {settlement_display}, {street_name}, {house_name} (джерело: poweron.toe.com.ua)")
