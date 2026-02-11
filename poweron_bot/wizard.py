@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import heapq
 import json
 import logging
 import os
@@ -29,54 +30,68 @@ class PowerOnWizard:
         self.user_data_backup_file = "data/users.json.bak"
         os.makedirs("data", exist_ok=True)
         self._users_payload = {}
+        self._users_payload_lock = threading.Lock()
+
+        self.metrics = {
+            "schedule_requests": 0,
+            "schedule_success": 0,
+            "schedule_failures": 0,
+            "text_fallbacks": 0,
+            "auto_update_runs": 0,
+            "auto_update_notifications": 0,
+            "last_render_ms": 0,
+        }
+        self._auto_update_heap = []
 
         self._auto_update_worker_started = False
         self._start_auto_update_worker()
 
     # ---------------------- persistence ----------------------
     def _load_users_payload(self):
-        if self._users_payload:
-            return
+        with self._users_payload_lock:
+            if self._users_payload:
+                return
 
-        if not os.path.exists(self.user_data_file):
-            self._users_payload = {}
-            return
+            if not os.path.exists(self.user_data_file):
+                self._users_payload = {}
+                return
 
-        try:
-            with open(self.user_data_file, "r", encoding="utf-8") as users_file:
-                payload = json.load(users_file)
-            self._users_payload = payload if isinstance(payload, dict) else {}
-        except Exception as exc:
-            self.logger.exception("poweron.user_data_load_failed error=%s", exc)
-            # restore from backup if possible
-            if os.path.exists(self.user_data_backup_file):
-                try:
-                    with open(self.user_data_backup_file, "r", encoding="utf-8") as users_file:
-                        payload = json.load(users_file)
-                    self._users_payload = payload if isinstance(payload, dict) else {}
-                    return
-                except Exception as backup_exc:
-                    self.logger.exception("poweron.user_data_backup_load_failed error=%s", backup_exc)
-            self._users_payload = {}
+            try:
+                with open(self.user_data_file, "r", encoding="utf-8") as users_file:
+                    payload = json.load(users_file)
+                self._users_payload = payload if isinstance(payload, dict) else {}
+            except Exception as exc:
+                self.logger.exception("poweron.user_data_load_failed error=%s", exc)
+                # restore from backup if possible
+                if os.path.exists(self.user_data_backup_file):
+                    try:
+                        with open(self.user_data_backup_file, "r", encoding="utf-8") as users_file:
+                            payload = json.load(users_file)
+                        self._users_payload = payload if isinstance(payload, dict) else {}
+                        return
+                    except Exception as backup_exc:
+                        self.logger.exception("poweron.user_data_backup_load_failed error=%s", backup_exc)
+                self._users_payload = {}
 
     def _save_users_payload(self):
         tmp_path = f"{self.user_data_file}.tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as users_file:
-                json.dump(self._users_payload, users_file, ensure_ascii=False, indent=2)
-
-            if os.path.exists(self.user_data_file):
-                with open(self.user_data_file, "r", encoding="utf-8") as src, open(self.user_data_backup_file, "w", encoding="utf-8") as dst:
-                    dst.write(src.read())
-
-            os.replace(tmp_path, self.user_data_file)
-        except Exception as exc:
-            self.logger.exception("poweron.user_data_save_failed error=%s", exc)
+        with self._users_payload_lock:
             try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
+                with open(tmp_path, "w", encoding="utf-8") as users_file:
+                    json.dump(self._users_payload, users_file, ensure_ascii=False, indent=2)
+
+                if os.path.exists(self.user_data_file):
+                    with open(self.user_data_file, "r", encoding="utf-8") as src, open(self.user_data_backup_file, "w", encoding="utf-8") as dst:
+                        dst.write(src.read())
+
+                os.replace(tmp_path, self.user_data_file)
+            except Exception as exc:
+                self.logger.exception("poweron.user_data_save_failed error=%s", exc)
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def _save_user_data(self, chat_id: int):
         self._load_users_payload()
@@ -409,6 +424,7 @@ class PowerOnWizard:
             settings["enabled"] = True
             settings["interval"] = interval
             settings["next_run_ts"] = time.time() + interval
+            self._schedule_auto_update(chat_id)
             self._save_user_data(chat_id)
             self.state.pop(chat_id, None)
             self.bot.send_message(chat_id, f"✅ Автооновлення увімкнено: кожні {interval} секунд.", reply_markup=self._auto_update_settings_keyboard(chat_id))
@@ -531,6 +547,7 @@ class PowerOnWizard:
                 settings["enabled"] = True
                 settings["interval"] = interval
                 settings["next_run_ts"] = time.time() + interval
+                self._schedule_auto_update(chat_id)
                 self._save_user_data(chat_id)
                 self.bot.send_message(chat_id, f"✅ Автооновлення увімкнено: кожні {interval} секунд.", reply_markup=self._auto_update_settings_keyboard(chat_id))
                 return True
@@ -590,46 +607,83 @@ class PowerOnWizard:
         return True
 
     # ---------------------- auto update worker ----------------------
+    def _schedule_auto_update(self, chat_id: int):
+        settings = self.auto_update.get(chat_id) or {}
+        if not settings.get("enabled"):
+            return
+
+        interval = max(10, int(settings.get("interval", 60) or 60))
+        next_ts = float(settings.get("next_run_ts", 0) or 0)
+        if not next_ts:
+            next_ts = time.time() + interval
+            settings["next_run_ts"] = next_ts
+        heapq.heappush(self._auto_update_heap, (next_ts, chat_id))
+
+    def _schedule_all_auto_updates(self):
+        self._auto_update_heap = []
+        for chat_id in self.auto_update.keys():
+            self._schedule_auto_update(chat_id)
+
     def _start_auto_update_worker(self):
         if self._auto_update_worker_started:
             return
         self._hydrate_users_cache_from_payload()
+        self._schedule_all_auto_updates()
         self._auto_update_worker_started = True
         worker = threading.Thread(target=self._auto_update_loop, name="poweron-auto-update", daemon=True)
         worker.start()
 
     def _auto_update_loop(self):
         while True:
-            time.sleep(1)
-            for chat_id, settings in list(self.auto_update.items()):
-                if not settings.get("enabled"):
-                    continue
+            time.sleep(0.5)
+            now = time.time()
+            if not self._auto_update_heap:
+                continue
 
-                interval = int(settings.get("interval", 60) or 60)
-                interval = max(10, interval)
-                now = time.time()
-                if now < float(settings.get("next_run_ts", 0) or 0):
-                    continue
+            next_run_ts, chat_id = heapq.heappop(self._auto_update_heap)
+            if next_run_ts > now:
+                heapq.heappush(self._auto_update_heap, (next_run_ts, chat_id))
+                continue
 
-                history = self.history.get(chat_id, [])
-                if not history:
-                    continue
+            settings = self.auto_update.get(chat_id, {})
+            if not settings.get("enabled"):
+                continue
 
-                settings["next_run_ts"] = now + interval
-                item = history[0]
-                result = self._render_schedule(chat_id, item)
-                if not result:
-                    continue
+            if float(settings.get("next_run_ts", 0) or 0) > next_run_ts + 0.001:
+                continue
 
-                image_path, entry, signature = result
-                changed = signature != settings.get("last_signature", "")
-                always_notify = not settings.get("silent", True)
+            interval = max(10, int(settings.get("interval", 60) or 60))
+            settings["next_run_ts"] = now + interval
+            self._schedule_auto_update(chat_id)
 
-                if changed or always_notify:
-                    self._deliver_schedule(chat_id, image_path, entry, item.get("schedule", {}), auto=True)
-                    settings["last_signature"] = signature
-                    self._upsert_history(chat_id, entry)
+            history = self.history.get(chat_id, [])
+            if not history:
                 self._save_user_data(chat_id)
+                continue
+
+            self.metrics["auto_update_runs"] += 1
+            item = history[0]
+            try:
+                result = self._render_schedule(chat_id, item)
+            except Exception as exc:
+                self.logger.exception("poweron.auto_update_render_failed chat_id=%s error=%s", chat_id, exc)
+                self._save_user_data(chat_id)
+                continue
+
+            if not result:
+                self._save_user_data(chat_id)
+                continue
+
+            image_path, entry, signature = result
+            changed = signature != settings.get("last_signature", "")
+            always_notify = not settings.get("silent", True)
+
+            if changed or always_notify:
+                self._deliver_schedule(chat_id, image_path, entry, item.get("schedule", {}), auto=True)
+                self.metrics["auto_update_notifications"] += 1
+                settings["last_signature"] = signature
+                self._upsert_history(chat_id, entry)
+            self._save_user_data(chat_id)
 
     # ---------------------- helpers ----------------------
     def _go_back(self, chat_id: int):
@@ -652,7 +706,7 @@ class PowerOnWizard:
             return
         self.start(chat_id)
 
-    def _render_schedule(self, chat_id: int, address_item: Optional[dict] = None):
+    def _build_entry_from_context(self, chat_id: int, address_item: Optional[dict] = None) -> Optional[dict]:
         session = self.state.get(chat_id)
         if not session and not address_item:
             return None
@@ -677,9 +731,7 @@ class PowerOnWizard:
             cache_key = f"{settlement['id']}:{street['id']}:{house['id']}"
             schedule = house.get("schedule", {})
 
-        image_path = asyncio.run(self.client.render_schedule_screenshot(settlement_render, street_name, house_name, cache_key))
-        signature = self._file_signature(image_path)
-        entry = {
+        return {
             "cache_key": cache_key,
             "settlement_name": settlement_display,
             "settlement_display": settlement_display,
@@ -688,6 +740,23 @@ class PowerOnWizard:
             "house_name": house_name,
             "schedule": schedule,
         }
+
+    def _render_schedule(self, chat_id: int, address_item: Optional[dict] = None):
+        entry = self._build_entry_from_context(chat_id, address_item)
+        if not entry:
+            return None
+
+        started = time.time()
+        image_path = asyncio.run(
+            self.client.render_schedule_screenshot(
+                entry["settlement_render"],
+                entry["street_name"],
+                entry["house_name"],
+                entry["cache_key"],
+            )
+        )
+        self.metrics["last_render_ms"] = int((time.time() - started) * 1000)
+        signature = self._file_signature(image_path)
         return image_path, entry, signature
 
     @staticmethod
@@ -697,6 +766,28 @@ class PowerOnWizard:
             for chunk in iter(lambda: image_file.read(65536), b""):
                 hasher.update(chunk)
         return hasher.hexdigest()
+
+    def _send_text_fallback(self, chat_id: int, entry: Optional[dict], schedule: Optional[dict], reason: str = ""):
+        self.metrics["text_fallbacks"] += 1
+        schedule = schedule or {}
+        address_caption = "невідомої адреси"
+        if entry:
+            address_caption = f"{entry.get('settlement_display', '—')}, {entry.get('street_name', '—')}, {entry.get('house_name', '—')}"
+
+        details = (
+            "⚠️ Не вдалося сформувати скріншот графіка. Надсилаю текстовий режим.\n"
+            f"Адреса: {address_caption}\n\n"
+            "Черги з API:\n"
+            f"• ГПВ: {schedule.get('gpv', '—')}\n"
+            f"• ГАВ: {schedule.get('gav', '—')}\n"
+            f"• АЧР: {schedule.get('achr', '—')}\n"
+            f"• ГВСП: {schedule.get('gvsp', '—')}\n"
+            f"• СГАВ: {schedule.get('sgav', '—')}\n"
+        )
+        if reason:
+            details += f"\nТехнічна причина: {reason}\n"
+        details += "\nВи також можете переглянути графік вручну: https://poweron.toe.com.ua/"
+        self.bot.send_message(chat_id, details, reply_markup=self._quick_access_keyboard(chat_id) or self._nav_keyboard())
 
     def _deliver_schedule(self, chat_id: int, image_path: str, entry: dict, schedule: dict, auto: bool = False):
         with open(image_path, "rb") as image_file:
@@ -722,23 +813,39 @@ class PowerOnWizard:
         )
 
     def _send_schedule(self, chat_id: int, address_item: Optional[dict] = None, show_wait: bool = True):
+        self.metrics["schedule_requests"] += 1
+        entry = self._build_entry_from_context(chat_id, address_item)
         try:
             if show_wait:
                 self.bot.send_message(chat_id, "⏳ Очікуйте, формую та завантажую графік...")
 
             result = self._render_schedule(chat_id, address_item)
             if not result:
+                self.metrics["schedule_failures"] += 1
+                self._send_text_fallback(chat_id, entry, (entry or {}).get("schedule", {}), reason="немає даних для рендеру")
                 return
 
             image_path, entry, signature = result
             self._deliver_schedule(chat_id, image_path, entry, entry.get("schedule", {}), auto=False)
+            self.metrics["schedule_success"] += 1
             self._upsert_history(chat_id, entry)
 
             settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "next_run_ts": 0})
             settings["last_signature"] = signature
             self._save_user_data(chat_id)
-        except PowerOnClientError:
-            self.bot.send_message(chat_id, "Не вдалося отримати графік. Спробуйте ще раз або відкрийте вручну: https://poweron.toe.com.ua/")
+        except PowerOnClientError as exc:
+            self.metrics["schedule_failures"] += 1
+            self.logger.warning("poweron.render_client_error chat_id=%s error=%s", chat_id, exc)
+            self._send_text_fallback(chat_id, entry, (entry or {}).get("schedule", {}), reason=str(exc))
         except Exception as exc:
+            self.metrics["schedule_failures"] += 1
             self.logger.exception("poweron.render_failed chat_id=%s error=%s", chat_id, exc)
-            self.bot.send_message(chat_id, "Не вдалося отримати графік. Спробуйте ще раз або відкрийте вручну: https://poweron.toe.com.ua/")
+            self._send_text_fallback(chat_id, entry, (entry or {}).get("schedule", {}), reason="непередбачена помилка")
+
+    def health_snapshot(self) -> dict:
+        return {
+            "wizard": dict(self.metrics),
+            "client": dict(self.client.metrics),
+            "users_loaded": len(self._users_payload),
+            "auto_heap_size": len(self._auto_update_heap),
+        }
