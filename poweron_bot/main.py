@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+from typing import Optional
 
 import telebot
 from telebot import types
@@ -54,6 +55,18 @@ def setup_user_logger() -> logging.Logger:
     return user_logger
 
 
+def setup_admin_logger() -> logging.Logger:
+    os.makedirs("logs", exist_ok=True)
+    admin_logger = logging.getLogger("poweron_admin_actions")
+    admin_logger.setLevel(logging.INFO)
+    admin_logger.propagate = False
+    if not admin_logger.handlers:
+        handler = logging.FileHandler("logs/admin_actions.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        admin_logger.addHandler(handler)
+    return admin_logger
+
+
 def admin_keyboard() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("📊 /stats", callback_data="admin:stats"))
@@ -61,6 +74,15 @@ def admin_keyboard() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton("📣 /broadcast", callback_data="admin:broadcast"))
     kb.add(types.InlineKeyboardButton("🛑 /shutdown", callback_data="admin:shutdown"))
     kb.add(types.InlineKeyboardButton("🔄 /restart", callback_data="admin:restart"))
+    return kb
+
+
+def broadcast_confirm_keyboard() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Підтвердити", callback_data="admin:broadcast_confirm"),
+        types.InlineKeyboardButton("❌ Скасувати", callback_data="admin:broadcast_cancel"),
+    )
     return kb
 
 
@@ -78,7 +100,9 @@ def main():
     bot = telebot.TeleBot(token)
     wizard = PowerOnWizard(bot)
     user_logger = setup_user_logger()
+    admin_logger = setup_admin_logger()
     admin_broadcast_pending = set()
+    admin_broadcast_draft = {}
 
     def is_allowed(message):
         user_id = getattr(message.from_user, "id", None)
@@ -88,6 +112,16 @@ def main():
 
     def is_admin(user_id: int) -> bool:
         return admin_user_id is not None and user_id == admin_user_id
+
+    def log_admin_action(user, action: str, details: str = "", chat_id: Optional[int] = None):
+        admin_logger.info(
+            "admin_action=%s user_id=%s username=%s chat_id=%s details=%s",
+            action,
+            getattr(user, "id", None),
+            getattr(user, "username", None),
+            chat_id,
+            details,
+        )
 
     def build_stats_text() -> str:
         wizard._load_users_payload()
@@ -100,6 +134,25 @@ def main():
             f"• Поточних in-memory станів: {len(wizard.state)}"
         )
 
+    def build_status_text(chat_id: int) -> str:
+        wizard._ensure_user_loaded(chat_id)
+        settings = wizard.auto_update.get(chat_id, {})
+        enabled = "✅ Увімкнено" if settings.get("enabled") else "⛔️ Вимкнено"
+        interval = int(settings.get("interval", 60) or 60)
+        mode = "🤫 Тихий" if settings.get("silent", True) else "🔔 Завжди"
+        history = wizard.history.get(chat_id, [])
+        last_address = "—"
+        if history:
+            last = history[0]
+            last_address = f"{last.get('settlement_display', '')}, {last.get('street_name', '')}, {last.get('house_name', '')}"
+
+        return (
+            "ℹ️ Ваш статус:\n"
+            f"• Автооновлення: {enabled}\n"
+            f"• Інтервал: {interval}с\n"
+            f"• Режим: {mode}\n"
+            f"• Остання адреса: {last_address}"
+        )
 
     def schedule_shutdown():
         def _stop():
@@ -112,6 +165,21 @@ def main():
             os.execv(sys.executable, [sys.executable, "-m", "poweron_bot.main"])
 
         threading.Timer(1.0, _restart).start()
+
+    def run_broadcast(text: str) -> int:
+        wizard._load_users_payload()
+        sent = 0
+        for chat_id_str in wizard._users_payload.keys():
+            try:
+                chat_id = int(chat_id_str)
+            except ValueError:
+                continue
+            try:
+                bot.send_message(chat_id, f"📣 Повідомлення від адміністратора:\n\n{text}")
+                sent += 1
+            except Exception:
+                continue
+        return sent
 
     def build_health_text() -> str:
         api_ok = False
@@ -148,28 +216,39 @@ def main():
         if is_admin(message.from_user.id):
             bot.send_message(message.chat.id, "🛠 Адмін-меню:", reply_markup=admin_keyboard())
 
+    @bot.message_handler(commands=["status"])
+    def cmd_status(message):
+        if not is_allowed(message):
+            bot.send_message(message.chat.id, "⛔️ Доступ заборонено")
+            return
+        bot.send_message(message.chat.id, build_status_text(message.chat.id))
+
     @bot.message_handler(commands=["admin"])
     def cmd_admin(message):
         if not is_admin(message.from_user.id):
             return
+        log_admin_action(message.from_user, "admin_menu_open", chat_id=message.chat.id)
         bot.send_message(message.chat.id, "🛠 Адмін-меню:", reply_markup=admin_keyboard())
 
     @bot.message_handler(commands=["stats"])
     def cmd_stats(message):
         if not is_admin(message.from_user.id):
             return
+        log_admin_action(message.from_user, "stats", chat_id=message.chat.id)
         bot.send_message(message.chat.id, build_stats_text())
 
     @bot.message_handler(commands=["health"])
     def cmd_health(message):
         if not is_admin(message.from_user.id):
             return
+        log_admin_action(message.from_user, "health", chat_id=message.chat.id)
         bot.send_message(message.chat.id, build_health_text())
 
     @bot.message_handler(commands=["broadcast"])
     def cmd_broadcast(message):
         if not is_admin(message.from_user.id):
             return
+        log_admin_action(message.from_user, "broadcast_start", chat_id=message.chat.id)
         admin_broadcast_pending.add(message.chat.id)
         bot.send_message(message.chat.id, "📣 Введіть текст для розсилки всім користувачам:")
 
@@ -177,6 +256,7 @@ def main():
     def cmd_shutdown(message):
         if not is_admin(message.from_user.id):
             return
+        log_admin_action(message.from_user, "shutdown", chat_id=message.chat.id)
         bot.send_message(message.chat.id, "🛑 Сервер буде зупинено через 1 секунду.")
         schedule_shutdown()
 
@@ -184,6 +264,7 @@ def main():
     def cmd_restart(message):
         if not is_admin(message.from_user.id):
             return
+        log_admin_action(message.from_user, "restart", chat_id=message.chat.id)
         bot.send_message(message.chat.id, "🔄 Перезапуск сервера через 1 секунду.")
         schedule_restart()
 
@@ -199,20 +280,13 @@ def main():
                 bot.send_message(message.chat.id, "Повідомлення порожнє. Введіть текст знову:")
                 return
             admin_broadcast_pending.discard(message.chat.id)
-
-            wizard._load_users_payload()
-            sent = 0
-            for chat_id_str in wizard._users_payload.keys():
-                try:
-                    chat_id = int(chat_id_str)
-                except ValueError:
-                    continue
-                try:
-                    bot.send_message(chat_id, f"📣 Повідомлення від адміністратора:\n\n{text}")
-                    sent += 1
-                except Exception:
-                    continue
-            bot.send_message(message.chat.id, f"✅ Розсилку завершено. Надіслано: {sent}")
+            admin_broadcast_draft[message.chat.id] = text
+            log_admin_action(message.from_user, "broadcast_preview", f"len={len(text)}", chat_id=message.chat.id)
+            bot.send_message(
+                message.chat.id,
+                f"📣 Попередній перегляд розсилки:\n\n{text}\n\nПідтвердити відправку?",
+                reply_markup=broadcast_confirm_keyboard(),
+            )
             return
 
         if wizard.handle_message(message):
@@ -226,20 +300,39 @@ def main():
             return
 
         if call.data == "admin:stats" and is_admin(call.from_user.id):
+            log_admin_action(call.from_user, "stats", chat_id=call.message.chat.id)
             bot.send_message(call.message.chat.id, build_stats_text())
             return
         if call.data == "admin:health" and is_admin(call.from_user.id):
+            log_admin_action(call.from_user, "health", chat_id=call.message.chat.id)
             bot.send_message(call.message.chat.id, build_health_text())
             return
         if call.data == "admin:broadcast" and is_admin(call.from_user.id):
+            log_admin_action(call.from_user, "broadcast_start", chat_id=call.message.chat.id)
             admin_broadcast_pending.add(call.message.chat.id)
             bot.send_message(call.message.chat.id, "📣 Введіть текст для розсилки всім користувачам:")
             return
+        if call.data == "admin:broadcast_confirm" and is_admin(call.from_user.id):
+            text = admin_broadcast_draft.pop(call.message.chat.id, "")
+            if not text:
+                bot.send_message(call.message.chat.id, "Немає підготовленого тексту для розсилки.")
+                return
+            sent = run_broadcast(text)
+            log_admin_action(call.from_user, "broadcast_confirm", f"sent={sent}", chat_id=call.message.chat.id)
+            bot.send_message(call.message.chat.id, f"✅ Розсилку завершено. Надіслано: {sent}")
+            return
+        if call.data == "admin:broadcast_cancel" and is_admin(call.from_user.id):
+            admin_broadcast_draft.pop(call.message.chat.id, None)
+            log_admin_action(call.from_user, "broadcast_cancel", chat_id=call.message.chat.id)
+            bot.send_message(call.message.chat.id, "❌ Розсилку скасовано.")
+            return
         if call.data == "admin:shutdown" and is_admin(call.from_user.id):
+            log_admin_action(call.from_user, "shutdown", chat_id=call.message.chat.id)
             bot.send_message(call.message.chat.id, "🛑 Сервер буде зупинено через 1 секунду.")
             schedule_shutdown()
             return
         if call.data == "admin:restart" and is_admin(call.from_user.id):
+            log_admin_action(call.from_user, "restart", chat_id=call.message.chat.id)
             bot.send_message(call.message.chat.id, "🔄 Перезапуск сервера через 1 секунду.")
             schedule_restart()
             return
