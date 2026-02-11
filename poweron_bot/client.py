@@ -10,9 +10,31 @@ from typing import Dict, List, Optional, Tuple
 BASE_API_URL = "https://api-poweron.toe.com.ua/api"
 BASE_SITE_URL = "https://poweron.toe.com.ua/"
 CACHE_TTL_SECONDS = 600
+API_RETRIES = 3
+CAPTURE_RETRIES = 2
+CACHE_CLEANUP_INTERVAL_SECONDS = 300
+CACHE_MAX_FILES = 500
+CACHE_MAX_FILE_AGE_SECONDS = 2 * 24 * 60 * 60
+
+SITE_PROFILE = {
+    "search_button_names": ["Знайти", "Пошук", "Показати", "Отримати графік"],
+    "search_button_fallback_text": "Знай",
+    "queue_card_selector": ".queue-card",
+    "schedule_markers": ["Черга", "Вибрано:", "подача електроенергії", "Графік"],
+    "selected_marker": "Вибрано:",
+    "legend_marker": "подача електроенергії",
+}
 
 
 class PowerOnClientError(Exception):
+    pass
+
+
+class PowerOnNetworkError(PowerOnClientError):
+    pass
+
+
+class PowerOnRenderError(PowerOnClientError):
     pass
 
 
@@ -28,6 +50,17 @@ class PowerOnClient:
         os.makedirs(self.cache_dir, exist_ok=True)
         self._cache: Dict[str, CacheRecord] = {}
         self._locks: Dict[str, Tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
+        self._last_cache_cleanup_ts = 0.0
+        self.metrics = {
+            "api_requests": 0,
+            "api_failures": 0,
+            "render_attempts": 0,
+            "render_failures": 0,
+            "fullpage_fallbacks": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "last_render_duration_ms": 0,
+        }
 
     def _get_lock_for_current_loop(self, cache_key: str) -> asyncio.Lock:
         current_loop = asyncio.get_running_loop()
@@ -48,25 +81,39 @@ class PowerOnClient:
         return importlib.util.find_spec(module_name) is not None
 
     async def _get_json(self, path: str, params: Optional[dict] = None) -> dict:
-        if self._has_module("httpx"):
-            import httpx
+        last_error = None
+        for attempt in range(1, API_RETRIES + 1):
+            self.metrics["api_requests"] += 1
+            try:
+                if self._has_module("httpx"):
+                    import httpx
 
-            async with httpx.AsyncClient(base_url=BASE_API_URL, timeout=30.0) as client:
-                response = await client.get(path, params=params)
-                response.raise_for_status()
-                return response.json()
+                    async with httpx.AsyncClient(base_url=BASE_API_URL, timeout=30.0) as client:
+                        response = await client.get(path, params=params)
+                        response.raise_for_status()
+                        return response.json()
 
-        if self._has_module("requests"):
-            import requests
+                if self._has_module("requests"):
+                    import requests
 
-            def _request_sync():
-                response = requests.get(f"{BASE_API_URL}{path}", params=params, timeout=30.0)
-                response.raise_for_status()
-                return response.json()
+                    def _request_sync():
+                        response = requests.get(f"{BASE_API_URL}{path}", params=params, timeout=30.0)
+                        response.raise_for_status()
+                        return response.json()
 
-            return await asyncio.to_thread(_request_sync)
+                    return await asyncio.to_thread(_request_sync)
 
-        raise PowerOnClientError("Відсутній HTTP-клієнт. Встановіть httpx або requests.")
+                raise PowerOnClientError("Відсутній HTTP-клієнт. Встановіть httpx або requests.")
+            except (TimeoutError, OSError) as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+
+            self.metrics["api_failures"] += 1
+            if attempt < API_RETRIES:
+                await asyncio.sleep(0.5 * attempt)
+
+        raise PowerOnNetworkError(f"Не вдалося отримати дані API: {last_error}")
 
     @staticmethod
     def _member_items(payload: dict) -> List[dict]:
@@ -133,25 +180,82 @@ class PowerOnClient:
                 break
         return result
 
+    def _cleanup_cache_files(self) -> None:
+        now = time.time()
+        if now - self._last_cache_cleanup_ts < CACHE_CLEANUP_INTERVAL_SECONDS:
+            return
+        self._last_cache_cleanup_ts = now
+
+        try:
+            files = []
+            for name in os.listdir(self.cache_dir):
+                path = os.path.join(self.cache_dir, name)
+                if not os.path.isfile(path) or not name.endswith(".png"):
+                    continue
+                stat = os.stat(path)
+                files.append((path, stat.st_mtime))
+
+            for path, mtime in files:
+                if now - mtime > CACHE_MAX_FILE_AGE_SECONDS:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+            files = sorted(
+                [(path, os.stat(path).st_mtime) for path, _ in files if os.path.exists(path)],
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            for path, _ in files[CACHE_MAX_FILES:]:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        except OSError:
+            return
+
     async def render_schedule_screenshot(self, settlement_name: str, street_name: str, house_name: str, cache_key: str) -> str:
+        self._cleanup_cache_files()
         now = time.time()
         cached = self._cache.get(cache_key)
         if cached and cached.expires_at > now and os.path.exists(cached.path):
+            self.metrics["cache_hits"] += 1
             return cached.path
 
+        self.metrics["cache_misses"] += 1
         lock = self._get_lock_for_current_loop(cache_key)
         async with lock:
             cached = self._cache.get(cache_key)
             if cached and cached.expires_at > now and os.path.exists(cached.path):
+                self.metrics["cache_hits"] += 1
                 return cached.path
 
             file_hash = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
             image_path = os.path.join(self.cache_dir, f"{file_hash}.png")
-            await self._capture_from_site(settlement_name, street_name, house_name, image_path)
-            self._cache[cache_key] = CacheRecord(path=image_path, expires_at=time.time() + CACHE_TTL_SECONDS)
-            return image_path
+
+            last_error = None
+            for attempt in range(1, CAPTURE_RETRIES + 1):
+                self.metrics["render_attempts"] += 1
+                started = time.time()
+                try:
+                    await self._capture_from_site(settlement_name, street_name, house_name, image_path)
+                    self.metrics["last_render_duration_ms"] = int((time.time() - started) * 1000)
+                    self._cache[cache_key] = CacheRecord(path=image_path, expires_at=time.time() + CACHE_TTL_SECONDS)
+                    return image_path
+                except (PowerOnRenderError, TimeoutError, OSError) as exc:
+                    last_error = exc
+                    self.metrics["render_failures"] += 1
+                    if attempt < CAPTURE_RETRIES:
+                        await asyncio.sleep(0.75 * attempt)
+
+            raise PowerOnRenderError(
+                "Не вдалося отримати графік. Спробуйте ще раз або відкрийте вручну: https://poweron.toe.com.ua/"
+            ) from last_error
 
     async def _capture_from_site(self, settlement_name: str, street_name: str, house_name: str, image_path: str) -> None:
+        from playwright.async_api import Error as PlaywrightError
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         from playwright.async_api import async_playwright
 
         async with async_playwright() as playwright:
@@ -166,38 +270,36 @@ class PowerOnClient:
                 await page.wait_for_load_state("networkidle")
                 await self._wait_for_schedule_render(page)
                 await self._screenshot_graph_fragment(page, image_path)
-            except Exception as exc:
-                raise PowerOnClientError("Не вдалося отримати графік. Спробуйте ще раз або відкрийте вручну: https://poweron.toe.com.ua/") from exc
+            except (PlaywrightTimeoutError, PlaywrightError) as exc:
+                raise PowerOnRenderError("Помилка рендеру графіка на сайті.") from exc
             finally:
                 await browser.close()
 
     @staticmethod
     async def _click_search_button(page) -> None:
-        button_names = ["Знайти", "Пошук", "Показати", "Отримати графік"]
-        for name in button_names:
+        for name in SITE_PROFILE["search_button_names"]:
             button = page.get_by_role("button", name=name).first
             if await button.count():
                 await button.click()
                 return
 
-        fallback_button = page.locator("button").filter(has_text="Знай").first
+        fallback_button = page.locator("button").filter(has_text=SITE_PROFILE["search_button_fallback_text"]).first
         if await fallback_button.count():
             await fallback_button.click()
             return
 
-        raise PowerOnClientError("Не знайдено кнопку пошуку графіка на сайті.")
+        raise PowerOnRenderError("Не знайдено кнопку пошуку графіка на сайті.")
 
     @staticmethod
     async def _wait_for_schedule_render(page) -> None:
-        queue_card = page.locator(".queue-card").first
+        queue_card = page.locator(SITE_PROFILE["queue_card_selector"]).first
         try:
             await queue_card.wait_for(timeout=10000)
             return
         except Exception:
             pass
 
-        likely_markers = ["Черга", "Вибрано:", "подача електроенергії", "Графік"]
-        for marker in likely_markers:
+        for marker in SITE_PROFILE["schedule_markers"]:
             element = page.get_by_text(marker, exact=False).first
             try:
                 await element.wait_for(timeout=4000)
@@ -207,18 +309,20 @@ class PowerOnClient:
 
         await page.wait_for_timeout(2000)
 
-    @staticmethod
-    async def _screenshot_graph_fragment(page, image_path: str) -> None:
+    def _mark_fullpage_fallback(self) -> None:
+        self.metrics["fullpage_fallbacks"] += 1
+
+    async def _screenshot_graph_fragment(self, page, image_path: str) -> None:
         viewport = page.viewport_size or {"width": 1400, "height": 2200}
 
-        queue_cards = page.locator(".queue-card")
+        queue_cards = page.locator(SITE_PROFILE["queue_card_selector"])
         cards_count = await queue_cards.count()
         if cards_count:
-            first_card_box = await PowerOnClient._safe_bounding_box(queue_cards.first)
-            last_card_box = await PowerOnClient._safe_bounding_box(queue_cards.nth(cards_count - 1))
+            first_card_box = await self._safe_bounding_box(queue_cards.first)
+            last_card_box = await self._safe_bounding_box(queue_cards.nth(cards_count - 1))
             if first_card_box and last_card_box:
-                selected_box = await PowerOnClient._safe_bounding_box(page.get_by_text("Вибрано:", exact=False).first)
-                legend_box = await PowerOnClient._safe_bounding_box(page.get_by_text("подача електроенергії", exact=False).first)
+                selected_box = await self._safe_bounding_box(page.get_by_text(SITE_PROFILE["selected_marker"], exact=False).first)
+                legend_box = await self._safe_bounding_box(page.get_by_text(SITE_PROFILE["legend_marker"], exact=False).first)
 
                 clip_top = first_card_box["y"] - 120
                 if selected_box:
@@ -239,6 +343,7 @@ class PowerOnClient:
                 )
                 return
 
+        self._mark_fullpage_fallback()
         await page.screenshot(path=image_path, full_page=True)
 
     @staticmethod

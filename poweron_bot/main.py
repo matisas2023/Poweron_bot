@@ -166,20 +166,38 @@ def main():
 
         threading.Timer(1.0, _restart).start()
 
-    def run_broadcast(text: str) -> int:
+    def run_broadcast(text: str) -> dict:
         wizard._load_users_payload()
         sent = 0
-        for chat_id_str in wizard._users_payload.keys():
+        failed = 0
+        failures = []
+        started = time.time()
+
+        for idx, chat_id_str in enumerate(wizard._users_payload.keys(), start=1):
             try:
                 chat_id = int(chat_id_str)
             except ValueError:
+                failed += 1
+                failures.append("invalid_chat_id")
                 continue
+
             try:
                 bot.send_message(chat_id, f"📣 Повідомлення від адміністратора:\n\n{text}")
                 sent += 1
-            except Exception:
-                continue
-        return sent
+            except Exception as exc:
+                failed += 1
+                failures.append(type(exc).__name__)
+
+            if idx % 25 == 0:
+                time.sleep(0.3)
+
+        duration_ms = int((time.time() - started) * 1000)
+        return {
+            "sent": sent,
+            "failed": failed,
+            "duration_ms": duration_ms,
+            "failure_types": sorted(set(failures))[:8],
+        }
 
     def build_health_text() -> str:
         api_ok = False
@@ -191,12 +209,20 @@ def main():
             api_error = str(exc)
 
         cache_ok = os.path.isdir(wizard.client.cache_dir)
+        snapshot = wizard.health_snapshot()
+        wizard_metrics = snapshot.get("wizard", {})
+        client_metrics = snapshot.get("client", {})
         return (
             "🩺 Health check:\n"
             f"• API: {'✅ OK' if api_ok else '❌ FAIL'}\n"
             f"• Cache dir: {'✅ OK' if cache_ok else '❌ FAIL'} ({wizard.client.cache_dir})\n"
             f"• Polling restart loop: ✅ enabled\n"
-            + (f"• API error: {api_error}" if api_error else "")
+            f"• schedule: req={wizard_metrics.get('schedule_requests', 0)} ok={wizard_metrics.get('schedule_success', 0)} fail={wizard_metrics.get('schedule_failures', 0)}\n"
+            f"• text fallback count: {wizard_metrics.get('text_fallbacks', 0)}\n"
+            f"• auto update: runs={wizard_metrics.get('auto_update_runs', 0)} notify={wizard_metrics.get('auto_update_notifications', 0)} heap={snapshot.get('auto_heap_size', 0)}\n"
+            f"• render: attempts={client_metrics.get('render_attempts', 0)} fail={client_metrics.get('render_failures', 0)} fullpage_fallback={client_metrics.get('fullpage_fallbacks', 0)}\n"
+            f"• cache: hits={client_metrics.get('cache_hits', 0)} miss={client_metrics.get('cache_misses', 0)}"
+            + (f"\n• API error: {api_error}" if api_error else "")
         )
 
     @bot.message_handler(commands=["start"])
@@ -317,9 +343,21 @@ def main():
             if not text:
                 bot.send_message(call.message.chat.id, "Немає підготовленого тексту для розсилки.")
                 return
-            sent = run_broadcast(text)
-            log_admin_action(call.from_user, "broadcast_confirm", f"sent={sent}", chat_id=call.message.chat.id)
-            bot.send_message(call.message.chat.id, f"✅ Розсилку завершено. Надіслано: {sent}")
+            broadcast_result = run_broadcast(text)
+            log_admin_action(
+                call.from_user,
+                "broadcast_confirm",
+                f"sent={broadcast_result['sent']} failed={broadcast_result['failed']} duration_ms={broadcast_result['duration_ms']}",
+                chat_id=call.message.chat.id,
+            )
+            bot.send_message(
+                call.message.chat.id,
+                "✅ Розсилку завершено.\n"
+                f"Надіслано: {broadcast_result['sent']}\n"
+                f"Помилок: {broadcast_result['failed']}\n"
+                f"Тривалість: {broadcast_result['duration_ms']} мс\n"
+                f"Типи помилок: {', '.join(broadcast_result['failure_types']) if broadcast_result['failure_types'] else '—'}",
+            )
             return
         if call.data == "admin:broadcast_cancel" and is_admin(call.from_user.id):
             admin_broadcast_draft.pop(call.message.chat.id, None)
