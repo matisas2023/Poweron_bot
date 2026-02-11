@@ -123,6 +123,19 @@ def main():
             details,
         )
 
+    def log_user_action(message, action: str, details: str = ""):
+        user = getattr(message, "from_user", None)
+        chat = getattr(message, "chat", None)
+        user_logger.info(
+            "user_action=%s chat_id=%s user_id=%s username=%s first_name=%s details=%s",
+            action,
+            getattr(chat, "id", None),
+            getattr(user, "id", None),
+            getattr(user, "username", None),
+            getattr(user, "first_name", None),
+            details,
+        )
+
     def build_stats_text() -> str:
         wizard._load_users_payload()
         users_total = len(wizard._users_payload)
@@ -244,6 +257,7 @@ def main():
 
     @bot.message_handler(commands=["status"])
     def cmd_status(message):
+        log_user_action(message, "status_command")
         if not is_allowed(message):
             bot.send_message(message.chat.id, "⛔️ Доступ заборонено")
             return
@@ -296,6 +310,8 @@ def main():
 
     @bot.message_handler(func=lambda m: True)
     def on_message(message):
+        text = (message.text or "").strip()
+        log_user_action(message, "message", f"text={text[:120]}")
         if not is_allowed(message):
             bot.send_message(message.chat.id, "⛔️ Доступ заборонено")
             return
@@ -317,7 +333,7 @@ def main():
 
         if wizard.handle_message(message):
             return
-        if (message.text or "").strip().lower() in {"/start", "start", "старт", "🚀 старт"}:
+        if text.lower() in {"/start", "start", "старт", "🚀 старт"}:
             wizard.send_home(message.chat.id)
 
     @bot.callback_query_handler(func=lambda call: True)
