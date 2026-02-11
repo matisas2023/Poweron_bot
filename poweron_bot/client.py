@@ -162,9 +162,9 @@ class PowerOnClient:
                 await self._select_option(page, 0, settlement_name)
                 await self._select_option(page, 1, street_name)
                 await self._select_option(page, 2, house_name)
-                await page.get_by_role("button", name="Знайти").click()
+                await self._click_search_button(page)
                 await page.wait_for_load_state("networkidle")
-                await page.wait_for_timeout(1500)
+                await self._wait_for_schedule_render(page)
                 await self._screenshot_graph_fragment(page, image_path)
             except Exception as exc:
                 raise PowerOnClientError("Не вдалося отримати графік. Спробуйте ще раз або відкрийте вручну: https://poweron.toe.com.ua/") from exc
@@ -172,17 +172,65 @@ class PowerOnClient:
                 await browser.close()
 
     @staticmethod
-    async def _screenshot_graph_fragment(page, image_path: str) -> None:
-        top_anchor = page.get_by_text("Вибрано:").first
-        bottom_anchor = page.get_by_text("Якщо у вас відсутня електроенергія", exact=False).first
-        if await top_anchor.count() == 0:
-            raise PowerOnClientError("Не вдалося отримати графік. Спробуйте ще раз або відкрийте вручну: https://poweron.toe.com.ua/")
-        top_box = await top_anchor.bounding_box()
-        if not top_box:
-            raise PowerOnClientError("Не вдалося отримати графік. Спробуйте ще раз або відкрийте вручну: https://poweron.toe.com.ua/")
+    async def _click_search_button(page) -> None:
+        button_names = ["Знайти", "Пошук", "Показати", "Отримати графік"]
+        for name in button_names:
+            button = page.get_by_role("button", name=name).first
+            if await button.count():
+                await button.click()
+                return
 
-        bottom_box = await bottom_anchor.bounding_box() if await bottom_anchor.count() else None
+        fallback_button = page.locator("button").filter(has_text="Знай").first
+        if await fallback_button.count():
+            await fallback_button.click()
+            return
+
+        raise PowerOnClientError("Не знайдено кнопку пошуку графіка на сайті.")
+
+    @staticmethod
+    async def _wait_for_schedule_render(page) -> None:
+        likely_markers = [
+            "Вибрано:",
+            "Графік",
+            "Відключ",
+            "Електроенергі",
+            "черг",
+        ]
+        for marker in likely_markers:
+            element = page.get_by_text(marker, exact=False).first
+            try:
+                await element.wait_for(timeout=5000)
+                return
+            except Exception:
+                continue
+
+        await page.wait_for_timeout(2000)
+
+    @staticmethod
+    async def _screenshot_graph_fragment(page, image_path: str) -> None:
+        top_box = None
+        for marker in ["Вибрано:", "Графік", "Відключ", "Електроенергі"]:
+            top_anchor = page.get_by_text(marker, exact=False).first
+            if await top_anchor.count() == 0:
+                continue
+            top_box = await top_anchor.bounding_box()
+            if top_box:
+                break
+
+        bottom_box = None
+        for marker in ["Якщо у вас відсутня електроенергія", "Корисні посилання", "Контакти", "FAQ"]:
+            bottom_anchor = page.get_by_text(marker, exact=False).first
+            if await bottom_anchor.count() == 0:
+                continue
+            bottom_box = await bottom_anchor.bounding_box()
+            if bottom_box:
+                break
+
         viewport = page.viewport_size or {"width": 1400, "height": 2200}
+        if not top_box:
+            await page.screenshot(path=image_path, full_page=True)
+            return
+
         clip_y = max(0, top_box["y"] - 20)
         clip_bottom = (bottom_box["y"] - 20) if bottom_box else (clip_y + 420)
         await page.screenshot(
@@ -193,10 +241,14 @@ class PowerOnClient:
     @staticmethod
     async def _select_option(page, input_index: int, desired_text: str) -> None:
         input_box = page.locator('input[id^="react-select-"]').nth(input_index)
+        if await input_box.count() == 0:
+            input_box = page.get_by_role("combobox").nth(input_index)
         await input_box.click(force=True)
         await input_box.fill("")
         await input_box.type(desired_text, delay=25)
-        options = page.locator('div[class*="menu"] div[class*="option"]')
+        options = page.locator('[class*="menu"] [class*="option"]')
+        if await options.count() == 0:
+            options = page.get_by_role("option")
         await options.first.wait_for(timeout=15000)
         count = await options.count()
         normalized_desired = (desired_text or "").lower().replace("вул. ", "").strip()
