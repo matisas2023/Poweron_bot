@@ -189,17 +189,18 @@ class PowerOnClient:
 
     @staticmethod
     async def _wait_for_schedule_render(page) -> None:
-        likely_markers = [
-            "Вибрано:",
-            "Графік",
-            "Відключ",
-            "Електроенергі",
-            "черг",
-        ]
+        queue_card = page.locator(".queue-card").first
+        try:
+            await queue_card.wait_for(timeout=10000)
+            return
+        except Exception:
+            pass
+
+        likely_markers = ["Черга", "Вибрано:", "подача електроенергії", "Графік"]
         for marker in likely_markers:
             element = page.get_by_text(marker, exact=False).first
             try:
-                await element.wait_for(timeout=5000)
+                await element.wait_for(timeout=4000)
                 return
             except Exception:
                 continue
@@ -208,35 +209,46 @@ class PowerOnClient:
 
     @staticmethod
     async def _screenshot_graph_fragment(page, image_path: str) -> None:
-        top_box = None
-        for marker in ["Вибрано:", "Графік", "Відключ", "Електроенергі"]:
-            top_anchor = page.get_by_text(marker, exact=False).first
-            if await top_anchor.count() == 0:
-                continue
-            top_box = await top_anchor.bounding_box()
-            if top_box:
-                break
-
-        bottom_box = None
-        for marker in ["Якщо у вас відсутня електроенергія", "Корисні посилання", "Контакти", "FAQ"]:
-            bottom_anchor = page.get_by_text(marker, exact=False).first
-            if await bottom_anchor.count() == 0:
-                continue
-            bottom_box = await bottom_anchor.bounding_box()
-            if bottom_box:
-                break
-
         viewport = page.viewport_size or {"width": 1400, "height": 2200}
-        if not top_box:
-            await page.screenshot(path=image_path, full_page=True)
-            return
 
-        clip_y = max(0, top_box["y"] - 20)
-        clip_bottom = (bottom_box["y"] - 20) if bottom_box else (clip_y + 420)
-        await page.screenshot(
-            path=image_path,
-            clip={"x": 40, "y": clip_y, "width": max(300, viewport["width"] - 80), "height": max(180, clip_bottom - clip_y)},
-        )
+        queue_cards = page.locator(".queue-card")
+        cards_count = await queue_cards.count()
+        if cards_count:
+            first_card_box = await PowerOnClient._safe_bounding_box(queue_cards.first)
+            last_card_box = await PowerOnClient._safe_bounding_box(queue_cards.nth(cards_count - 1))
+            if first_card_box and last_card_box:
+                selected_box = await PowerOnClient._safe_bounding_box(page.get_by_text("Вибрано:", exact=False).first)
+                legend_box = await PowerOnClient._safe_bounding_box(page.get_by_text("подача електроенергії", exact=False).first)
+
+                clip_top = first_card_box["y"] - 120
+                if selected_box:
+                    clip_top = min(clip_top, selected_box["y"] - 20)
+
+                clip_bottom = last_card_box["y"] + last_card_box["height"] + 40
+                if legend_box:
+                    clip_bottom = max(clip_bottom, legend_box["y"] + legend_box["height"] + 40)
+
+                await page.screenshot(
+                    path=image_path,
+                    clip={
+                        "x": 40,
+                        "y": max(0, clip_top),
+                        "width": max(300, viewport["width"] - 80),
+                        "height": max(220, clip_bottom - max(0, clip_top)),
+                    },
+                )
+                return
+
+        await page.screenshot(path=image_path, full_page=True)
+
+    @staticmethod
+    async def _safe_bounding_box(locator):
+        try:
+            if await locator.count() == 0:
+                return None
+            return await locator.bounding_box()
+        except Exception:
+            return None
 
     @staticmethod
     async def _select_option(page, input_index: int, desired_text: str) -> None:
