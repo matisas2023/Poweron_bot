@@ -1,11 +1,11 @@
 import asyncio
 import hashlib
+import importlib.util
 import os
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-import httpx
 
 BASE_API_URL = "https://api-poweron.toe.com.ua/api"
 BASE_SITE_URL = "https://poweron.toe.com.ua/"
@@ -43,11 +43,30 @@ class PowerOnClient:
             self._locks[cache_key] = (current_loop, lock)
         return lock
 
+    @staticmethod
+    def _has_module(module_name: str) -> bool:
+        return importlib.util.find_spec(module_name) is not None
+
     async def _get_json(self, path: str, params: Optional[dict] = None) -> dict:
-        async with httpx.AsyncClient(base_url=BASE_API_URL, timeout=30.0) as client:
-            response = await client.get(path, params=params)
-            response.raise_for_status()
-            return response.json()
+        if self._has_module("httpx"):
+            import httpx
+
+            async with httpx.AsyncClient(base_url=BASE_API_URL, timeout=30.0) as client:
+                response = await client.get(path, params=params)
+                response.raise_for_status()
+                return response.json()
+
+        if self._has_module("requests"):
+            import requests
+
+            def _request_sync():
+                response = requests.get(f"{BASE_API_URL}{path}", params=params, timeout=30.0)
+                response.raise_for_status()
+                return response.json()
+
+            return await asyncio.to_thread(_request_sync)
+
+        raise PowerOnClientError("Відсутній HTTP-клієнт. Встановіть httpx або requests.")
 
     @staticmethod
     def _member_items(payload: dict) -> List[dict]:

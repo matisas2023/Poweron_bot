@@ -45,6 +45,8 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
+> Для Termux: бот підтримує HTTP-клієнт **httpx** або **requests**. Якщо з `httpx` є проблема у середовищі, можна використовувати `requests` (вже додано в `requirements.txt`).
+
 ### 2) Налаштуй токен бота
 
 Підтримуються 2 способи (пріоритет має змінна оточення):
