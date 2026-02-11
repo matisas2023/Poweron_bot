@@ -154,10 +154,19 @@ class PowerOnWizard:
         return kb
 
     def _home_keyboard(self):
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-        kb.add(types.KeyboardButton("💡 Графік світла (за адресою)"))
-        kb.add(types.KeyboardButton("⚙️ Налаштування"))
-        kb.add(types.KeyboardButton("🏠 Головна"))
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+        kb.add(
+            types.KeyboardButton("💡 Графік світла"),
+            types.KeyboardButton("📌 Закріплені"),
+        )
+        kb.add(
+            types.KeyboardButton("🕘 Історія"),
+            types.KeyboardButton("⚙️ Налаштування"),
+        )
+        kb.add(
+            types.KeyboardButton("ℹ️ Статус"),
+            types.KeyboardButton("🏠 Головна"),
+        )
         return kb
 
     @staticmethod
@@ -181,6 +190,20 @@ class PowerOnWizard:
 
         kb.add(types.InlineKeyboardButton("⚙️ Автооновлення", callback_data="poweron:auto_settings"))
         return kb if has_any else kb
+
+    def _pinned_keyboard(self, chat_id: int) -> Optional[types.InlineKeyboardMarkup]:
+        self._ensure_user_loaded(chat_id)
+        pinned = self.pinned.get(chat_id, [])
+        if not pinned:
+            return None
+
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for idx, item in enumerate(pinned[:3]):
+            kb.add(types.InlineKeyboardButton(f"📌 {self._address_caption(item)}", callback_data=f"poweron:pin_open:{idx}"))
+        nav = self._nav_keyboard()
+        for row in nav.keyboard:
+            kb.keyboard.append(row)
+        return kb
 
     def _history_keyboard(self, chat_id: int) -> Optional[types.InlineKeyboardMarkup]:
         self._ensure_user_loaded(chat_id)
@@ -284,6 +307,26 @@ class PowerOnWizard:
         self.rate_limit[chat_id] = now
         return False
 
+    def _status_text(self, chat_id: int) -> str:
+        self._ensure_user_loaded(chat_id)
+        settings = self.auto_update.get(chat_id, {})
+        enabled = "✅ Увімкнено" if settings.get("enabled") else "⛔️ Вимкнено"
+        interval = int(settings.get("interval", 60) or 60)
+        mode = "🤫 Тихий" if settings.get("silent", True) else "🔔 Завжди"
+        history = self.history.get(chat_id, [])
+        last_address = "—"
+        if history:
+            last = history[0]
+            last_address = f"{last.get('settlement_display', '')}, {last.get('street_name', '')}, {last.get('house_name', '')}"
+
+        return (
+            "ℹ️ Ваш статус:\n"
+            f"• Автооновлення: {enabled}\n"
+            f"• Інтервал: {interval}с\n"
+            f"• Режим: {mode}\n"
+            f"• Остання адреса: {last_address}"
+        )
+
     def send_home(self, chat_id: int):
         self._ensure_user_loaded(chat_id)
         if chat_id not in self.seen_users:
@@ -293,7 +336,7 @@ class PowerOnWizard:
                 chat_id,
                 """👋 Вітаю! Це бот для перегляду графіків відключень електроенергії за вашою адресою.
 
-Натисніть кнопку нижче, щоб почати пошук.""",
+Натисніть кнопку «💡 Графік світла», щоб почати пошук.""",
                 reply_markup=self._home_keyboard(),
             )
             return
@@ -318,13 +361,33 @@ class PowerOnWizard:
         session = self.state.get(chat_id)
         text = (message.text or "").strip()
 
-        if text == "💡 Графік світла (за адресою)":
+        if text in {"💡 Графік світла (за адресою)", "💡 Графік світла"}:
             self.start(chat_id)
+            return True
+
+        if text == "📌 Закріплені":
+            pinned_kb = self._pinned_keyboard(chat_id)
+            if not pinned_kb:
+                self.bot.send_message(chat_id, "Немає закріплених адрес. Закріпіть адресу з історії.")
+            else:
+                self.bot.send_message(chat_id, "📌 Ваші закріплені адреси:", reply_markup=pinned_kb)
+            return True
+
+        if text == "🕘 Історія":
+            history_kb = self._history_keyboard(chat_id)
+            if not history_kb:
+                self.bot.send_message(chat_id, "Історія порожня. Спочатку перегляньте графік хоча б для однієї адреси.")
+            else:
+                self.bot.send_message(chat_id, "🕘 Останні 3 адреси. Можна відкрити або закріпити:", reply_markup=history_kb)
             return True
 
         if text == "⚙️ Налаштування":
             self.state.pop(chat_id, None)
             self.send_settings(chat_id)
+            return True
+
+        if text == "ℹ️ Статус":
+            self.bot.send_message(chat_id, self._status_text(chat_id), reply_markup=self._home_keyboard())
             return True
 
         if text == "🏠 Головна":
