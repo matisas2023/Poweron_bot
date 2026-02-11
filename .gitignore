@@ -1,0 +1,9 @@
+# Local bot secrets
+
+# Runtime artifacts
+tmp/
+__pycache__/
+*.pyc
+logs/
+data/users.json
+poweron_admin_user_id.txt
