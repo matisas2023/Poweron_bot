@@ -11,6 +11,7 @@ from typing import Dict, Optional
 from telebot import types
 
 from poweron_bot.client import PowerOnClient, PowerOnClientError
+from poweron_bot.paths import DATA_DIR
 
 
 class PowerOnWizard:
@@ -26,9 +27,9 @@ class PowerOnWizard:
         self.auto_update: Dict[int, dict] = {}
         self.rate_limit: Dict[int, float] = {}
 
-        self.user_data_file = "data/users.json"
-        self.user_data_backup_file = "data/users.json.bak"
-        os.makedirs("data", exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self.user_data_file = DATA_DIR / "users.json"
+        self.user_data_backup_file = DATA_DIR / "users.json.bak"
         self._users_payload = {}
         self._users_payload_lock = threading.Lock()
 
@@ -52,20 +53,20 @@ class PowerOnWizard:
             if self._users_payload:
                 return
 
-            if not os.path.exists(self.user_data_file):
+            if not self.user_data_file.exists():
                 self._users_payload = {}
                 return
 
             try:
-                with open(self.user_data_file, "r", encoding="utf-8") as users_file:
+                with self.user_data_file.open("r", encoding="utf-8") as users_file:
                     payload = json.load(users_file)
                 self._users_payload = payload if isinstance(payload, dict) else {}
             except Exception as exc:
                 self.logger.exception("poweron.user_data_load_failed error=%s", exc)
                 # restore from backup if possible
-                if os.path.exists(self.user_data_backup_file):
+                if self.user_data_backup_file.exists():
                     try:
-                        with open(self.user_data_backup_file, "r", encoding="utf-8") as users_file:
+                        with self.user_data_backup_file.open("r", encoding="utf-8") as users_file:
                             payload = json.load(users_file)
                         self._users_payload = payload if isinstance(payload, dict) else {}
                         return
@@ -74,21 +75,21 @@ class PowerOnWizard:
                 self._users_payload = {}
 
     def _save_users_payload(self):
-        tmp_path = f"{self.user_data_file}.tmp"
+        tmp_path = self.user_data_file.with_suffix(".json.tmp")
         with self._users_payload_lock:
             try:
-                with open(tmp_path, "w", encoding="utf-8") as users_file:
+                with tmp_path.open("w", encoding="utf-8") as users_file:
                     json.dump(self._users_payload, users_file, ensure_ascii=False, indent=2)
 
-                if os.path.exists(self.user_data_file):
-                    with open(self.user_data_file, "r", encoding="utf-8") as src, open(self.user_data_backup_file, "w", encoding="utf-8") as dst:
+                if self.user_data_file.exists():
+                    with self.user_data_file.open("r", encoding="utf-8") as src, self.user_data_backup_file.open("w", encoding="utf-8") as dst:
                         dst.write(src.read())
 
                 os.replace(tmp_path, self.user_data_file)
             except Exception as exc:
                 self.logger.exception("poweron.user_data_save_failed error=%s", exc)
                 try:
-                    if os.path.exists(tmp_path):
+                    if tmp_path.exists():
                         os.remove(tmp_path)
                 except OSError:
                     pass

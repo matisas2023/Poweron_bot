@@ -1,8 +1,11 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 from poweron_bot.client import PowerOnClient, PowerOnClientError
+from poweron_bot.logging_setup import get_admin_logger, get_user_logger
+from poweron_bot.paths import BASE_DIR
 from poweron_bot.wizard import PowerOnWizard
 
 
@@ -45,6 +48,18 @@ class ClientTests(unittest.TestCase):
                 os.environ.pop("POWERON_BROWSER_PATH", None)
             else:
                 os.environ["POWERON_BROWSER_PATH"] = old
+
+
+class LoggingTests(unittest.TestCase):
+    def test_logging_handlers_use_project_logs_dir(self):
+        user_logger = get_user_logger()
+        admin_logger = get_admin_logger()
+
+        user_paths = {Path(getattr(handler, "baseFilename", "")) for handler in user_logger.handlers}
+        admin_paths = {Path(getattr(handler, "baseFilename", "")) for handler in admin_logger.handlers}
+
+        self.assertIn(BASE_DIR / "logs" / "user_entries.log", user_paths)
+        self.assertIn(BASE_DIR / "logs" / "admin_actions.log", admin_paths)
 
 
 class WizardFallbackTests(unittest.TestCase):

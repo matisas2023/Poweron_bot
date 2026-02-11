@@ -5,6 +5,7 @@ import os
 import shutil
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
@@ -47,8 +48,11 @@ class CacheRecord:
 
 
 class PowerOnClient:
-    def __init__(self, cache_dir: str = "tmp/poweron"):
-        self.cache_dir = cache_dir
+    def __init__(self, cache_dir: Optional[str] = None):
+        from poweron_bot.paths import TMP_DIR
+
+        default_cache_dir = TMP_DIR / "poweron"
+        self.cache_dir = str(Path(cache_dir).resolve()) if cache_dir else str(default_cache_dir)
         os.makedirs(self.cache_dir, exist_ok=True)
         self._cache: Dict[str, CacheRecord] = {}
         self._locks: Dict[str, Tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
