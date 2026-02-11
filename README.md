@@ -45,6 +45,23 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
+### Ubuntu 22.04 (важливо для скріншотів)
+
+Якщо на Ubuntu 22.04 не формується скріншот, встановіть системний Chromium і залежності Playwright:
+
+```bash
+sudo apt update
+sudo apt install -y chromium-browser
+python -m playwright install chromium
+python -m playwright install-deps chromium
+```
+
+За потреби можна явно задати шлях до браузера:
+
+```bash
+export POWERON_BROWSER_PATH="/usr/bin/chromium-browser"
+```
+
 > Для Termux: бот підтримує HTTP-клієнт **httpx** або **requests**. Якщо з `httpx` є проблема у середовищі, можна використовувати `requests` (вже додано в `requirements.txt`).
 
 ### 2) Налаштуй токен бота
@@ -97,8 +114,8 @@ python -m compileall poweron_bot
 - **`Set POWERON_BOT_TOKEN or create poweron_bot_token.txt`**  
   Не задано токен через ENV і відсутній файл `poweron_bot_token.txt`.
 
-- **Playwright не запускає Chromium**  
-  Виконай: `python -m playwright install chromium`.
+- **Playwright не запускає Chromium (особливо Ubuntu 22.04)**  
+  Виконай: `python -m playwright install chromium && python -m playwright install-deps chromium`, встанови `chromium-browser` і за потреби задай `POWERON_BROWSER_PATH=/usr/bin/chromium-browser`.
 
 - **`ModuleNotFoundError` на залежностях**  
   Перевстанови пакети: `pip install -r requirements.txt`.
