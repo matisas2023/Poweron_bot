@@ -33,6 +33,19 @@ class ClientTests(unittest.TestCase):
             client._cleanup_cache_files()
             self.assertFalse(os.path.exists(old_path))
 
+    def test_browser_candidates_prefers_env_path(self):
+        old = os.environ.get("POWERON_BROWSER_PATH")
+        try:
+            os.environ["POWERON_BROWSER_PATH"] = "/opt/custom/chrome"
+            candidates = PowerOnClient._browser_executable_candidates()
+            self.assertGreaterEqual(len(candidates), 1)
+            self.assertEqual(candidates[0], "/opt/custom/chrome")
+        finally:
+            if old is None:
+                os.environ.pop("POWERON_BROWSER_PATH", None)
+            else:
+                os.environ["POWERON_BROWSER_PATH"] = old
+
 
 class WizardFallbackTests(unittest.TestCase):
     def test_send_schedule_falls_back_to_text(self):

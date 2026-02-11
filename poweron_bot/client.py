@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import importlib.util
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -15,6 +16,7 @@ CAPTURE_RETRIES = 2
 CACHE_CLEANUP_INTERVAL_SECONDS = 300
 CACHE_MAX_FILES = 500
 CACHE_MAX_FILE_AGE_SECONDS = 2 * 24 * 60 * 60
+BROWSER_ENV_PATH = "POWERON_BROWSER_PATH"
 
 SITE_PROFILE = {
     "search_button_names": ["Знайти", "Пошук", "Показати", "Отримати графік"],
@@ -253,13 +255,71 @@ class PowerOnClient:
                 "Не вдалося отримати графік. Спробуйте ще раз або відкрийте вручну: https://poweron.toe.com.ua/"
             ) from last_error
 
+
+    @staticmethod
+    def _browser_executable_candidates() -> List[str]:
+        env_path = (os.getenv(BROWSER_ENV_PATH, "") or "").strip()
+        candidates = []
+        if env_path:
+            candidates.append(env_path)
+
+        for binary in [
+            "chromium",
+            "chromium-browser",
+            "google-chrome",
+            "google-chrome-stable",
+        ]:
+            resolved = shutil.which(binary)
+            if resolved:
+                candidates.append(resolved)
+
+        # unique preserve order
+        uniq = []
+        for item in candidates:
+            if item not in uniq:
+                uniq.append(item)
+        return uniq
+
+    @staticmethod
+    def _ubuntu_browser_launch_args() -> List[str]:
+        return [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ]
+
     async def _capture_from_site(self, settlement_name: str, street_name: str, house_name: str, image_path: str) -> None:
         from playwright.async_api import Error as PlaywrightError
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         from playwright.async_api import async_playwright
 
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
+            launch_kwargs = {"headless": True, "args": self._ubuntu_browser_launch_args()}
+            browser = None
+            launch_errors = []
+
+            try:
+                browser = await playwright.chromium.launch(**launch_kwargs)
+            except Exception as bundled_exc:
+                launch_errors.append(f"bundled_chromium={bundled_exc}")
+
+            if browser is None:
+                for candidate in self._browser_executable_candidates():
+                    try:
+                        browser = await playwright.chromium.launch(executable_path=candidate, **launch_kwargs)
+                        break
+                    except Exception as exc:
+                        launch_errors.append(f"{candidate}={exc}")
+
+            if browser is None:
+                errors_preview = "; ".join(launch_errors[:3])
+                raise PowerOnRenderError(
+                    "Не вдалося запустити браузер для скріншота (Ubuntu 22.04). "
+                    "Встановіть Chromium: `sudo apt install chromium-browser` або задайте POWERON_BROWSER_PATH. "
+                    f"Деталі: {errors_preview}"
+                )
+
             page = await browser.new_page(viewport={"width": 1400, "height": 2200})
             try:
                 await page.goto(BASE_SITE_URL, wait_until="networkidle", timeout=60000)
