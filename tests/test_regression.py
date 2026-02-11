@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-from poweron_bot.client import PowerOnClient
+from poweron_bot.client import PowerOnClient, PowerOnClientError
 from poweron_bot.wizard import PowerOnWizard
 
 
@@ -40,7 +40,7 @@ class WizardFallbackTests(unittest.TestCase):
         wizard = PowerOnWizard(bot)
 
         def _raise_render(*args, **kwargs):
-            raise Exception("boom")
+            raise PowerOnClientError("boom")
 
         wizard._render_schedule = _raise_render
         wizard.state[1] = {
