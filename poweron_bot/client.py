@@ -62,6 +62,7 @@ class PowerOnClient:
             "cache_hits": 0,
             "cache_misses": 0,
             "last_render_duration_ms": 0,
+            "last_render_error": "",
         }
 
     def _get_lock_for_current_loop(self, cache_key: str) -> asyncio.Lock:
@@ -247,6 +248,7 @@ class PowerOnClient:
                     return image_path
                 except (PowerOnRenderError, TimeoutError, OSError) as exc:
                     last_error = exc
+                    self.metrics["last_render_error"] = str(exc)
                     self.metrics["render_failures"] += 1
                     if attempt < CAPTURE_RETRIES:
                         await asyncio.sleep(0.75 * attempt)
@@ -322,12 +324,12 @@ class PowerOnClient:
 
             page = await browser.new_page(viewport={"width": 1400, "height": 2200})
             try:
-                await page.goto(BASE_SITE_URL, wait_until="networkidle", timeout=60000)
+                await page.goto(BASE_SITE_URL, wait_until="domcontentloaded", timeout=60000)
                 await self._select_option(page, 0, settlement_name)
                 await self._select_option(page, 1, street_name)
                 await self._select_option(page, 2, house_name)
                 await self._click_search_button(page)
-                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(1200)
                 await self._wait_for_schedule_render(page)
                 await self._screenshot_graph_fragment(page, image_path)
             except (PlaywrightTimeoutError, PlaywrightError) as exc:
@@ -419,17 +421,29 @@ class PowerOnClient:
     async def _select_option(page, input_index: int, desired_text: str) -> None:
         input_box = page.locator('input[id^="react-select-"]').nth(input_index)
         if await input_box.count() == 0:
+            input_box = page.locator('div[class*="control"] input').nth(input_index)
+        if await input_box.count() == 0:
             input_box = page.get_by_role("combobox").nth(input_index)
+
         await input_box.click(force=True)
         await input_box.fill("")
         await input_box.type(desired_text, delay=25)
-        options = page.locator('[class*="menu"] [class*="option"]')
+
+        options = page.locator('[class*="menu"] [class*="option"], [id*="-option-"]')
         if await options.count() == 0:
             options = page.get_by_role("option")
-        await options.first.wait_for(timeout=15000)
+
+        try:
+            await options.first.wait_for(timeout=12000)
+        except Exception:
+            # for house input site can accept raw value with Enter
+            await input_box.press("Enter")
+            await page.wait_for_timeout(300)
+            return
+
         count = await options.count()
         normalized_desired = (desired_text or "").lower().replace("вул. ", "").strip()
-        for idx in range(min(count, 20)):
+        for idx in range(min(count, 30)):
             option_text = (await options.nth(idx).inner_text()).strip()
             if option_text.lower().replace("вул. ", "").strip() == normalized_desired:
                 await options.nth(idx).click()
