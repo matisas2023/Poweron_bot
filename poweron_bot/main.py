@@ -16,7 +16,7 @@ import telebot
 from telebot import types
 
 from poweron_bot.logging_setup import get_admin_logger, get_user_logger
-from poweron_bot.paths import ADMIN_ID_FILE, BASE_DIR, TMP_DIR
+from poweron_bot.paths import ADMIN_ID_FILE, BASE_DIR, LOGS_DIR, TMP_DIR
 from poweron_bot.wizard import PowerOnWizard
 
 
@@ -56,6 +56,9 @@ def admin_keyboard() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton("📊 /stats", callback_data="admin:stats"))
     kb.add(types.InlineKeyboardButton("🩺 /health", callback_data="admin:health"))
     kb.add(types.InlineKeyboardButton("📣 /broadcast", callback_data="admin:broadcast"))
+    kb.add(types.InlineKeyboardButton("🧪 /selftest_logs", callback_data="admin:selftest_logs"))
+    kb.add(types.InlineKeyboardButton("🖼 /selftest_plot", callback_data="admin:selftest_plot"))
+    kb.add(types.InlineKeyboardButton("📥 /download_logs", callback_data="admin:download_logs"))
     kb.add(types.InlineKeyboardButton("🛑 /shutdown", callback_data="admin:shutdown"))
     kb.add(types.InlineKeyboardButton("🔄 /restart", callback_data="admin:restart"))
     return kb
@@ -170,6 +173,53 @@ def main():
 
         user_logger.info("user_action=test_plot_generated chat_id=%s file=%s", chat_id, image_path)
         return image_path
+
+    def send_logs_to_admin(chat_id: int, user, source: str):
+        sent_count = 0
+        missing_files = []
+        for log_file in (LOGS_DIR / "admin_actions.log", LOGS_DIR / "user_entries.log"):
+            if not log_file.exists():
+                missing_files.append(log_file.name)
+                continue
+            with log_file.open("rb") as fh:
+                bot.send_document(chat_id, fh, visible_file_name=log_file.name, caption=f"📥 Лог: {log_file.name}")
+            sent_count += 1
+
+        details = f"source={source} sent={sent_count} missing={','.join(missing_files) if missing_files else '-'}"
+        log_admin_action(user, "download_logs", details, chat_id=chat_id)
+
+        if sent_count == 0:
+            bot.send_message(chat_id, "⚠️ Лог-файли поки що відсутні. Спробуйте /selftest_logs і повторіть.")
+        elif missing_files:
+            bot.send_message(chat_id, f"✅ Надіслано {sent_count} лог(и). Відсутні: {', '.join(missing_files)}")
+
+    def run_selftest_logs(chat_id: int, user, source: str, message=None):
+        log_admin_action(user, "selftest_logs", f"source={source}", chat_id=chat_id)
+        if message is not None:
+            log_user_action(message, "selftest_logs")
+        else:
+            user_logger.info(
+                "user_action=selftest_logs chat_id=%s user_id=%s username=%s details=%s",
+                chat_id,
+                getattr(user, "id", None),
+                getattr(user, "username", None),
+                f"source={source}",
+            )
+        bot.send_message(chat_id, "✅ Тестові записи додані в admin_actions.log і user_entries.log")
+
+    def run_selftest_plot(chat_id: int, user, source: str):
+        image_path = None
+        try:
+            image_path = create_test_plot(chat_id)
+            with image_path.open("rb") as image_file:
+                bot.send_photo(chat_id, image_file, caption="🧪 Тестовий PNG-графік (headless/Agg)")
+            log_admin_action(user, "selftest_plot", f"source={source} file={image_path.name}", chat_id=chat_id)
+        except Exception as exc:
+            user_logger.exception("user_action=selftest_plot_failed chat_id=%s error=%s", chat_id, exc)
+            bot.send_message(chat_id, "❌ Не вдалося згенерувати тестовий графік.")
+        finally:
+            if image_path and image_path.exists():
+                image_path.unlink(missing_ok=True)
 
     def schedule_shutdown():
         def _stop():
@@ -300,27 +350,19 @@ def main():
     def cmd_selftest_logs(message):
         if not is_admin(message.from_user.id):
             return
-        log_admin_action(message.from_user, "selftest_logs", chat_id=message.chat.id)
-        log_user_action(message, "selftest_logs")
-        bot.send_message(message.chat.id, "✅ Тестові записи додані в admin_actions.log і user_entries.log")
+        run_selftest_logs(message.chat.id, message.from_user, source="command", message=message)
 
     @bot.message_handler(commands=["selftest_plot"])
     def cmd_selftest_plot(message):
         if not is_admin(message.from_user.id):
             return
+        run_selftest_plot(message.chat.id, message.from_user, source="command")
 
-        image_path = None
-        try:
-            image_path = create_test_plot(message.chat.id)
-            with image_path.open("rb") as image_file:
-                bot.send_photo(message.chat.id, image_file, caption="🧪 Тестовий PNG-графік (headless/Agg)")
-            log_admin_action(message.from_user, "selftest_plot", f"file={image_path.name}", chat_id=message.chat.id)
-        except Exception as exc:
-            user_logger.exception("user_action=selftest_plot_failed chat_id=%s error=%s", message.chat.id, exc)
-            bot.send_message(message.chat.id, "❌ Не вдалося згенерувати тестовий графік.")
-        finally:
-            if image_path and image_path.exists():
-                image_path.unlink(missing_ok=True)
+    @bot.message_handler(commands=["download_logs"])
+    def cmd_download_logs(message):
+        if not is_admin(message.from_user.id):
+            return
+        send_logs_to_admin(message.chat.id, message.from_user, source="command")
 
     @bot.message_handler(commands=["shutdown"])
     def cmd_shutdown(message):
@@ -409,6 +451,15 @@ def main():
             admin_broadcast_draft.pop(call.message.chat.id, None)
             log_admin_action(call.from_user, "broadcast_cancel", chat_id=call.message.chat.id)
             bot.send_message(call.message.chat.id, "❌ Розсилку скасовано.")
+            return
+        if call.data == "admin:selftest_logs" and is_admin(call.from_user.id):
+            run_selftest_logs(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:selftest_plot" and is_admin(call.from_user.id):
+            run_selftest_plot(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:download_logs" and is_admin(call.from_user.id):
+            send_logs_to_admin(call.message.chat.id, call.from_user, source="callback")
             return
         if call.data == "admin:shutdown" and is_admin(call.from_user.id):
             log_admin_action(call.from_user, "shutdown", chat_id=call.message.chat.id)
