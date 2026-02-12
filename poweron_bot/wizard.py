@@ -212,16 +212,16 @@ class PowerOnWizard:
     def _home_keyboard(self):
         kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
         kb.add(
-            types.KeyboardButton("💡 Графік світла"),
-            types.KeyboardButton("📌 Закріплені"),
+            types.KeyboardButton("⚡ Перевірити графік"),
+            types.KeyboardButton("📌 Мої адреси"),
         )
         kb.add(
-            types.KeyboardButton("🕘 Історія"),
-            types.KeyboardButton("⚙️ Налаштування"),
+            types.KeyboardButton("🕘 Недавні"),
+            types.KeyboardButton("🎛 Налаштування"),
         )
         kb.add(
-            types.KeyboardButton("ℹ️ Статус"),
-            types.KeyboardButton("🏠 Головна"),
+            types.KeyboardButton("📡 Статус"),
+            types.KeyboardButton("🏠 Додому"),
         )
         return kb
 
@@ -376,7 +376,8 @@ class PowerOnWizard:
             last_address = f"{last.get('settlement_display', '')}, {last.get('street_name', '')}, {last.get('house_name', '')}"
 
         return (
-            "ℹ️ Ваш статус:\n"
+            "📡 Ваш статус\n"
+            "────────────\n"
             f"• Автооновлення: {enabled}\n"
             f"• Інтервал: {interval}с\n"
             f"• Режим: {mode}\n"
@@ -391,26 +392,28 @@ class PowerOnWizard:
             self._save_user_data(chat_id)
             self.bot.send_message(
                 chat_id,
-                """👋 Вітаю! Це бот для перегляду графіків відключень електроенергії за вашою адресою.
+                """⚡ PowerON • Швидкий старт
 
-Натисніть кнопку «💡 Графік світла», щоб почати пошук.""",
+Це сучасний бот для перевірки графіків відключень за вашою адресою.
+
+Натисніть «⚡ Перевірити графік», щоб почати пошук.""",
                 reply_markup=self._home_keyboard(),
             )
             return
 
-        self.bot.send_message(chat_id, "Окремий бот для графіків відключень.", reply_markup=self._home_keyboard())
+        self.bot.send_message(chat_id, "⚡ PowerON готовий. Оберіть дію нижче 👇", reply_markup=self._home_keyboard())
 
     def send_settings(self, chat_id: int):
         self._ensure_user_loaded(chat_id)
-        self.bot.send_message(chat_id, "⚙️ Налаштування бота:", reply_markup=self._settings_keyboard(chat_id))
+        self.bot.send_message(chat_id, "🎛 Панель налаштувань:", reply_markup=self._settings_keyboard(chat_id))
 
     def start(self, chat_id: int):
         self._ensure_user_loaded(chat_id)
         self.state[chat_id] = {"step": "settlement_query"}
         extra_kb = self._quick_access_keyboard(chat_id)
         if extra_kb:
-            self.bot.send_message(chat_id, "⚡ Швидкий доступ: закріплені та нещодавні адреси.", reply_markup=extra_kb)
-        self.bot.send_message(chat_id, "🔎 Крок 1/3: Введіть 2–5 символів населеного пункту.", reply_markup=self._nav_keyboard())
+            self.bot.send_message(chat_id, "✨ Швидкий доступ: закріплені та недавні адреси.", reply_markup=extra_kb)
+        self.bot.send_message(chat_id, "🔎 Крок 1/3 · Введіть 2–5 символів населеного пункту.", reply_markup=self._nav_keyboard())
 
     # ---------------------- message/callback handlers ----------------------
     def handle_message(self, message) -> bool:
@@ -418,11 +421,11 @@ class PowerOnWizard:
         session = self.state.get(chat_id)
         text = (message.text or "").strip()
 
-        if text in {"💡 Графік світла (за адресою)", "💡 Графік світла"}:
+        if text in {"💡 Графік світла (за адресою)", "💡 Графік світла", "⚡ Перевірити графік"}:
             self.start(chat_id)
             return True
 
-        if text == "📌 Закріплені":
+        if text in {"📌 Закріплені", "📌 Мої адреси"}:
             pinned_kb = self._pinned_keyboard(chat_id)
             if not pinned_kb:
                 self.bot.send_message(chat_id, "Немає закріплених адрес. Закріпіть адресу з історії.")
@@ -430,7 +433,7 @@ class PowerOnWizard:
                 self.bot.send_message(chat_id, "📌 Ваші закріплені адреси:", reply_markup=pinned_kb)
             return True
 
-        if text == "🕘 Історія":
+        if text in {"🕘 Історія", "🕘 Недавні"}:
             history_kb = self._history_keyboard(chat_id)
             if not history_kb:
                 self.bot.send_message(chat_id, "Історія порожня. Спочатку перегляньте графік хоча б для однієї адреси.")
@@ -438,16 +441,16 @@ class PowerOnWizard:
                 self.bot.send_message(chat_id, "🕘 Останні 3 адреси. Можна відкрити або закріпити:", reply_markup=history_kb)
             return True
 
-        if text == "⚙️ Налаштування":
+        if text in {"⚙️ Налаштування", "🎛 Налаштування"}:
             self.state.pop(chat_id, None)
             self.send_settings(chat_id)
             return True
 
-        if text == "ℹ️ Статус":
+        if text in {"ℹ️ Статус", "📡 Статус"}:
             self.bot.send_message(chat_id, self._status_text(chat_id), reply_markup=self._home_keyboard())
             return True
 
-        if text == "🏠 Головна":
+        if text in {"🏠 Головна", "🏠 Додому"}:
             self.state.pop(chat_id, None)
             self.send_home(chat_id)
             return True
@@ -786,7 +789,7 @@ class PowerOnWizard:
             return
         if step in {"street_query", "street_pick"}:
             session["step"] = "settlement_query"
-            self.bot.send_message(chat_id, "🔎 Крок 1/3: Введіть 2–5 символів населеного пункту.", reply_markup=self._nav_keyboard())
+            self.bot.send_message(chat_id, "🔎 Крок 1/3 · Введіть 2–5 символів населеного пункту.", reply_markup=self._nav_keyboard())
             return
         if step in {"house_query", "house_pick"}:
             session["step"] = "street_query"
