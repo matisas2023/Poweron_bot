@@ -12,6 +12,12 @@ from telebot import types
 
 from poweron_bot.client import PowerOnClient, PowerOnClientError
 from poweron_bot.paths import DATA_DIR
+from poweron_bot.storage import UserStateStore
+
+MAX_HISTORY_ITEMS = 5
+MAX_PINNED_ITEMS = 5
+AUTO_UPDATE_FAILURE_THRESHOLD = 3
+AUTO_UPDATE_COOLDOWN_SECONDS = 15 * 60
 
 
 class PowerOnWizard:
@@ -30,8 +36,18 @@ class PowerOnWizard:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.user_data_file = DATA_DIR / "users.json"
         self.user_data_backup_file = DATA_DIR / "users.json.bak"
+        self.user_state_db_file = DATA_DIR / "users.sqlite"
+        self.store = UserStateStore(self.user_state_db_file)
         self._users_payload = {}
         self._users_payload_lock = threading.Lock()
+
+        self.feature_flags = {
+            "analytics_enabled": True,
+            "multi_address_auto": True,
+            "quiet_hours_enabled": True,
+            "text_mode_cooldown": True,
+            "compare_enabled": True,
+        }
 
         self.metrics = {
             "schedule_requests": 0,
@@ -61,6 +77,8 @@ class PowerOnWizard:
                 with self.user_data_file.open("r", encoding="utf-8") as users_file:
                     payload = json.load(users_file)
                 self._users_payload = payload if isinstance(payload, dict) else {}
+                if self._users_payload:
+                    self.store.replace_all(self._users_payload)
             except Exception as exc:
                 self.logger.exception("poweron.user_data_load_failed error=%s", exc)
                 # restore from backup if possible
@@ -69,10 +87,12 @@ class PowerOnWizard:
                         with self.user_data_backup_file.open("r", encoding="utf-8") as users_file:
                             payload = json.load(users_file)
                         self._users_payload = payload if isinstance(payload, dict) else {}
+                        if self._users_payload:
+                            self.store.replace_all(self._users_payload)
                         return
                     except Exception as backup_exc:
                         self.logger.exception("poweron.user_data_backup_load_failed error=%s", backup_exc)
-                self._users_payload = {}
+                self._users_payload = self.store.load_all()
 
     def _save_users_payload(self):
         tmp_path = self.user_data_file.with_suffix(".json.tmp")
@@ -86,6 +106,7 @@ class PowerOnWizard:
                         dst.write(src.read())
 
                 os.replace(tmp_path, self.user_data_file)
+                self.store.replace_all(self._users_payload)
             except Exception as exc:
                 self.logger.exception("poweron.user_data_save_failed error=%s", exc)
                 try:
@@ -100,7 +121,7 @@ class PowerOnWizard:
         self._users_payload[payload_key] = {
             "seen": chat_id in self.seen_users,
             "history": self.history.get(chat_id, [])[:3],
-            "pinned": self.pinned.get(chat_id, [])[:3],
+            "pinned": self.pinned.get(chat_id, [])[:MAX_PINNED_ITEMS],
             "auto_update": self.auto_update.get(
                 chat_id,
                 {
@@ -108,10 +129,17 @@ class PowerOnWizard:
                     "interval": 60,
                     "silent": True,
                     "last_signature": "",
+                    "last_signatures": {},
                     "next_run_ts": 0,
+                    "quiet_hours": {"enabled": True, "start": 23, "end": 7},
+                    "max_per_hour": 4,
+                    "notify_timestamps": [],
+                    "failures": 0,
+                    "text_mode_until": 0,
                 },
             ),
         }
+        self.store.upsert_chat(chat_id, self._users_payload[payload_key])
         self._save_users_payload()
 
     def _hydrate_users_cache_from_payload(self):
@@ -122,8 +150,8 @@ class PowerOnWizard:
             except (TypeError, ValueError):
                 continue
 
-            self.history[chat_id] = user_payload.get("history", [])[:3]
-            self.pinned[chat_id] = user_payload.get("pinned", [])[:3]
+            self.history[chat_id] = user_payload.get("history", [])[:MAX_HISTORY_ITEMS]
+            self.pinned[chat_id] = user_payload.get("pinned", [])[:MAX_PINNED_ITEMS]
             auto_update = user_payload.get("auto_update") or {}
             interval = int(auto_update.get("interval", 60) or 60)
             self.auto_update[chat_id] = {
@@ -131,7 +159,13 @@ class PowerOnWizard:
                 "interval": max(10, interval),
                 "silent": bool(auto_update.get("silent", True)),
                 "last_signature": auto_update.get("last_signature", ""),
+                "last_signatures": auto_update.get("last_signatures", {}),
                 "next_run_ts": float(auto_update.get("next_run_ts", 0) or 0),
+                "quiet_hours": auto_update.get("quiet_hours", {"enabled": True, "start": 23, "end": 7}),
+                "max_per_hour": int(auto_update.get("max_per_hour", 4) or 4),
+                "notify_timestamps": auto_update.get("notify_timestamps", []),
+                "failures": int(auto_update.get("failures", 0) or 0),
+                "text_mode_until": float(auto_update.get("text_mode_until", 0) or 0),
             }
 
             if user_payload.get("seen"):
@@ -143,8 +177,8 @@ class PowerOnWizard:
 
         self._load_users_payload()
         user_payload = self._users_payload.get(str(chat_id), {})
-        self.history[chat_id] = user_payload.get("history", [])[:3]
-        self.pinned[chat_id] = user_payload.get("pinned", [])[:3]
+        self.history[chat_id] = user_payload.get("history", [])[:MAX_HISTORY_ITEMS]
+        self.pinned[chat_id] = user_payload.get("pinned", [])[:MAX_PINNED_ITEMS]
 
         auto_update = user_payload.get("auto_update") or {}
         interval = int(auto_update.get("interval", 60) or 60)
@@ -153,7 +187,13 @@ class PowerOnWizard:
             "interval": max(10, interval),
             "silent": bool(auto_update.get("silent", True)),
             "last_signature": auto_update.get("last_signature", ""),
+            "last_signatures": auto_update.get("last_signatures", {}),
             "next_run_ts": float(auto_update.get("next_run_ts", 0) or 0),
+            "quiet_hours": auto_update.get("quiet_hours", {"enabled": True, "start": 23, "end": 7}),
+            "max_per_hour": int(auto_update.get("max_per_hour", 4) or 4),
+            "notify_timestamps": auto_update.get("notify_timestamps", []),
+            "failures": int(auto_update.get("failures", 0) or 0),
+            "text_mode_until": float(auto_update.get("text_mode_until", 0) or 0),
         }
 
         if user_payload.get("seen"):
@@ -298,7 +338,7 @@ class PowerOnWizard:
         history = self.history.setdefault(chat_id, [])
         history = [entry for entry in history if entry["cache_key"] != item["cache_key"]]
         history.insert(0, item)
-        self.history[chat_id] = history[:3]
+        self.history[chat_id] = history[:MAX_HISTORY_ITEMS]
         self._save_user_data(chat_id)
 
     def _toggle_pin(self, chat_id: int, item: dict) -> str:
@@ -311,7 +351,7 @@ class PowerOnWizard:
             return "❌ Адресу відкріплено."
         pinned = [entry for entry in pinned if entry["cache_key"] != item["cache_key"]]
         pinned.insert(0, item)
-        self.pinned[chat_id] = pinned[:3]
+        self.pinned[chat_id] = pinned[:MAX_PINNED_ITEMS]
         self._save_user_data(chat_id)
         return "📌 Адресу закріплено."
 
@@ -340,7 +380,8 @@ class PowerOnWizard:
             f"• Автооновлення: {enabled}\n"
             f"• Інтервал: {interval}с\n"
             f"• Режим: {mode}\n"
-            f"• Остання адреса: {last_address}"
+            f"• Остання адреса: {last_address}\n"
+            f"• Адрес в історії: {len(history)}"
         )
 
     def send_home(self, chat_id: int):
@@ -421,7 +462,7 @@ class PowerOnWizard:
                 self.bot.send_message(chat_id, "Мінімальний інтервал — 10 секунд.")
                 return True
 
-            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "next_run_ts": 0})
+            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "last_signatures": {}, "next_run_ts": 0, "quiet_hours": {"enabled": True, "start": 23, "end": 7}, "max_per_hour": 4, "notify_timestamps": [], "failures": 0, "text_mode_until": 0})
             settings["enabled"] = True
             settings["interval"] = interval
             settings["next_run_ts"] = time.time() + interval
@@ -503,6 +544,13 @@ class PowerOnWizard:
             self._go_back(chat_id)
             return True
 
+        if data == "poweron:retry_last":
+            history = self.history.get(chat_id, [])
+            if history:
+                self._send_schedule(chat_id, history[0])
+            else:
+                self.bot.send_message(chat_id, "Немає попередньої адреси для повтору.")
+            return True
         if data == "poweron:history":
             history_kb = self._history_keyboard(chat_id)
             if not history_kb:
@@ -519,7 +567,7 @@ class PowerOnWizard:
             return True
         if data == "poweron:auto_toggle_silent":
             self._ensure_user_loaded(chat_id)
-            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "next_run_ts": 0})
+            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "last_signatures": {}, "next_run_ts": 0, "quiet_hours": {"enabled": True, "start": 23, "end": 7}, "max_per_hour": 4, "notify_timestamps": [], "failures": 0, "text_mode_until": 0})
             settings["silent"] = not settings.get("silent", True)
             self._save_user_data(chat_id)
             mode = "🤫 Тихий" if settings["silent"] else "🔔 Завжди"
@@ -531,7 +579,7 @@ class PowerOnWizard:
             return True
         if data == "poweron:auto_off":
             self._ensure_user_loaded(chat_id)
-            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "next_run_ts": 0})
+            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "last_signatures": {}, "next_run_ts": 0, "quiet_hours": {"enabled": True, "start": 23, "end": 7}, "max_per_hour": 4, "notify_timestamps": [], "failures": 0, "text_mode_until": 0})
             settings["enabled"] = False
             settings["next_run_ts"] = 0
             self._save_user_data(chat_id)
@@ -544,7 +592,7 @@ class PowerOnWizard:
                 if interval < 10:
                     interval = 10
                 self._ensure_user_loaded(chat_id)
-                settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "next_run_ts": 0})
+                settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "last_signatures": {}, "next_run_ts": 0, "quiet_hours": {"enabled": True, "start": 23, "end": 7}, "max_per_hour": 4, "notify_timestamps": [], "failures": 0, "text_mode_until": 0})
                 settings["enabled"] = True
                 settings["interval"] = interval
                 settings["next_run_ts"] = time.time() + interval
@@ -607,6 +655,35 @@ class PowerOnWizard:
 
         return True
 
+
+    def _is_quiet_hours(self, settings: dict) -> bool:
+        quiet = settings.get("quiet_hours") or {}
+        if not quiet.get("enabled", True):
+            return False
+        start = int(quiet.get("start", 23) or 23)
+        end = int(quiet.get("end", 7) or 7)
+        hour = time.localtime().tm_hour
+        if start == end:
+            return False
+        if start < end:
+            return start <= hour < end
+        return hour >= start or hour < end
+
+    def _can_notify_now(self, settings: dict) -> bool:
+        now = time.time()
+        timestamps = [ts for ts in (settings.get("notify_timestamps") or []) if now - ts < 3600]
+        settings["notify_timestamps"] = timestamps
+        max_per_hour = max(1, int(settings.get("max_per_hour", 4) or 4))
+        if len(timestamps) >= max_per_hour:
+            return False
+        if self._is_quiet_hours(settings):
+            return False
+        return True
+
+    @staticmethod
+    def _entry_signature(entry: dict) -> str:
+        return entry.get("cache_key", "")
+
     # ---------------------- auto update worker ----------------------
     def _schedule_auto_update(self, chat_id: int):
         settings = self.auto_update.get(chat_id) or {}
@@ -658,32 +735,42 @@ class PowerOnWizard:
             self._schedule_auto_update(chat_id)
 
             history = self.history.get(chat_id, [])
-            if not history:
+            candidates = history[:MAX_HISTORY_ITEMS] if self.feature_flags.get("multi_address_auto", True) else history[:1]
+            if not candidates:
                 self._save_user_data(chat_id)
                 continue
 
             self.metrics["auto_update_runs"] += 1
-            item = history[0]
-            try:
-                result = self._render_schedule(chat_id, item)
-            except Exception as exc:
-                self.logger.exception("poweron.auto_update_render_failed chat_id=%s error=%s", chat_id, exc)
-                self._save_user_data(chat_id)
-                continue
+            for item in candidates:
+                entry_key = self._entry_signature(item)
+                try:
+                    if float(settings.get("text_mode_until", 0) or 0) > time.time():
+                        continue
+                    result = self._render_schedule(chat_id, item)
+                    settings["failures"] = 0
+                except Exception as exc:
+                    settings["failures"] = int(settings.get("failures", 0) or 0) + 1
+                    self.logger.exception("poweron.auto_update_render_failed chat_id=%s error=%s", chat_id, exc)
+                    if settings["failures"] >= AUTO_UPDATE_FAILURE_THRESHOLD and self.feature_flags.get("text_mode_cooldown", True):
+                        settings["text_mode_until"] = time.time() + AUTO_UPDATE_COOLDOWN_SECONDS
+                    continue
 
-            if not result:
-                self._save_user_data(chat_id)
-                continue
+                if not result:
+                    continue
 
-            image_path, entry, signature = result
-            changed = signature != settings.get("last_signature", "")
-            always_notify = not settings.get("silent", True)
+                image_path, entry, signature = result
+                signatures = settings.setdefault("last_signatures", {})
+                previous_sig = signatures.get(entry_key, settings.get("last_signature", ""))
+                changed = signature != previous_sig
+                always_notify = not settings.get("silent", True)
 
-            if changed or always_notify:
-                self._deliver_schedule(chat_id, image_path, entry, item.get("schedule", {}), auto=True)
-                self.metrics["auto_update_notifications"] += 1
-                settings["last_signature"] = signature
-                self._upsert_history(chat_id, entry)
+                if (changed or always_notify) and self._can_notify_now(settings):
+                    self._deliver_schedule(chat_id, image_path, entry, item.get("schedule", {}), auto=True)
+                    self.metrics["auto_update_notifications"] += 1
+                    settings["notify_timestamps"] = (settings.get("notify_timestamps") or []) + [time.time()]
+                    signatures[entry_key] = signature
+                    settings["last_signature"] = signature
+                    self._upsert_history(chat_id, entry)
             self._save_user_data(chat_id)
 
     # ---------------------- helpers ----------------------
@@ -831,7 +918,7 @@ class PowerOnWizard:
             self.metrics["schedule_success"] += 1
             self._upsert_history(chat_id, entry)
 
-            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "next_run_ts": 0})
+            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "last_signatures": {}, "next_run_ts": 0, "quiet_hours": {"enabled": True, "start": 23, "end": 7}, "max_per_hour": 4, "notify_timestamps": [], "failures": 0, "text_mode_until": 0})
             settings["last_signature"] = signature
             self._save_user_data(chat_id)
         except PowerOnClientError as exc:
@@ -849,4 +936,5 @@ class PowerOnWizard:
             "client": dict(self.client.metrics),
             "users_loaded": len(self._users_payload),
             "auto_heap_size": len(self._auto_update_heap),
+            "feature_flags": dict(self.feature_flags),
         }

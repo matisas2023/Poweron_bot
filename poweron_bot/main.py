@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+import csv
 import tempfile
 import threading
 import time
@@ -54,11 +55,15 @@ def parse_admin_id(raw_value: str):
 def admin_keyboard() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("📊 /stats", callback_data="admin:stats"))
+    kb.add(types.InlineKeyboardButton("📈 /analytics", callback_data="admin:analytics"))
     kb.add(types.InlineKeyboardButton("🩺 /health", callback_data="admin:health"))
     kb.add(types.InlineKeyboardButton("📣 /broadcast", callback_data="admin:broadcast"))
     kb.add(types.InlineKeyboardButton("🧪 /selftest_logs", callback_data="admin:selftest_logs"))
     kb.add(types.InlineKeyboardButton("🖼 /selftest_plot", callback_data="admin:selftest_plot"))
     kb.add(types.InlineKeyboardButton("📥 /download_logs", callback_data="admin:download_logs"))
+    kb.add(types.InlineKeyboardButton("👥 /users_export", callback_data="admin:users_export"))
+    kb.add(types.InlineKeyboardButton("📄 /logs_tail", callback_data="admin:logs_tail"))
+    kb.add(types.InlineKeyboardButton("🎛 /feature_flags", callback_data="admin:feature_flags"))
     kb.add(types.InlineKeyboardButton("🛑 /shutdown", callback_data="admin:shutdown"))
     kb.add(types.InlineKeyboardButton("🔄 /restart", callback_data="admin:restart"))
     return kb
@@ -292,6 +297,71 @@ def main():
             + (f"\n• API error: {api_error}" if api_error else "")
         )
 
+    def build_analytics_text() -> str:
+        snapshot = wizard.health_snapshot()
+        wizard_metrics = snapshot.get("wizard", {})
+        client_metrics = snapshot.get("client", {})
+        users_total = len(wizard._users_payload)
+        dau = sum(1 for item in wizard._users_payload.values() if item.get("seen"))
+        return (
+            "📈 Analytics\n"
+            f"• Users total: {users_total}\n"
+            f"• Active seen users: {dau}\n"
+            f"• schedule req/success/fail: {wizard_metrics.get('schedule_requests', 0)}/{wizard_metrics.get('schedule_success', 0)}/{wizard_metrics.get('schedule_failures', 0)}\n"
+            f"• auto notifications: {wizard_metrics.get('auto_update_notifications', 0)}\n"
+            f"• render fail: {client_metrics.get('render_failures', 0)}\n"
+            f"• last render ms: {wizard_metrics.get('last_render_ms', 0)}"
+        )
+
+    def send_users_export(chat_id: int, user, source: str):
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        export_path = TMP_DIR / "users_export.csv"
+        with export_path.open("w", encoding="utf-8", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["chat_id", "seen", "history_count", "pinned_count", "auto_enabled", "auto_interval", "silent"])
+            for chat_id_str, payload in wizard._users_payload.items():
+                auto = payload.get("auto_update") or {}
+                writer.writerow([
+                    chat_id_str,
+                    int(bool(payload.get("seen"))),
+                    len(payload.get("history") or []),
+                    len(payload.get("pinned") or []),
+                    int(bool(auto.get("enabled"))),
+                    int(auto.get("interval", 60) or 60),
+                    int(bool(auto.get("silent", True))),
+                ])
+        with export_path.open("rb") as csv_file:
+            bot.send_document(chat_id, csv_file, visible_file_name="users_export.csv", caption="👥 Експорт користувачів")
+        log_admin_action(user, "users_export", f"source={source}", chat_id=chat_id)
+
+    def send_logs_tail(chat_id: int, user, source: str, lines: int = 100):
+        snippets = []
+        for log_file in (LOGS_DIR / "admin_actions.log", LOGS_DIR / "user_entries.log"):
+            if not log_file.exists():
+                snippets.append(f"{log_file.name}: файл відсутній")
+                continue
+            content = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-lines:]
+            snippets.append(f"{log_file.name}:\n" + "\n".join(content[-20:]))
+        text_payload = "\n\n".join(snippets)[:3800]
+        bot.send_message(chat_id, f"📄 Останні записи логів:\n\n{text_payload}")
+        log_admin_action(user, "logs_tail", f"source={source} lines={lines}", chat_id=chat_id)
+
+    def build_feature_flags_text() -> str:
+        flags = wizard.feature_flags
+        lines = ["🎛 Feature flags:"]
+        for key, value in sorted(flags.items()):
+            lines.append(f"• {key} = {'ON' if value else 'OFF'}")
+        lines.append("\nПеремкнути: /feature_flags <name> <on|off>")
+        return "\n".join(lines)
+
+    def set_feature_flag(user, chat_id: int, name: str, value: bool):
+        if name not in wizard.feature_flags:
+            bot.send_message(chat_id, f"Невідомий feature flag: {name}")
+            return
+        wizard.feature_flags[name] = value
+        log_admin_action(user, "feature_flag_set", f"{name}={value}", chat_id=chat_id)
+        bot.send_message(chat_id, f"✅ {name} => {'ON' if value else 'OFF'}")
+
     @bot.message_handler(commands=["start"])
     def cmd_start(message):
         user = message.from_user
@@ -331,6 +401,14 @@ def main():
         log_admin_action(message.from_user, "stats", chat_id=message.chat.id)
         bot.send_message(message.chat.id, build_stats_text())
 
+    @bot.message_handler(commands=["analytics"])
+    def cmd_analytics(message):
+        if not is_admin(message.from_user.id):
+            return
+        wizard._load_users_payload()
+        log_admin_action(message.from_user, "analytics", chat_id=message.chat.id)
+        bot.send_message(message.chat.id, build_analytics_text())
+
     @bot.message_handler(commands=["health"])
     def cmd_health(message):
         if not is_admin(message.from_user.id):
@@ -363,6 +441,31 @@ def main():
         if not is_admin(message.from_user.id):
             return
         send_logs_to_admin(message.chat.id, message.from_user, source="command")
+
+    @bot.message_handler(commands=["users_export"])
+    def cmd_users_export(message):
+        if not is_admin(message.from_user.id):
+            return
+        wizard._load_users_payload()
+        send_users_export(message.chat.id, message.from_user, source="command")
+
+    @bot.message_handler(commands=["logs_tail"])
+    def cmd_logs_tail(message):
+        if not is_admin(message.from_user.id):
+            return
+        send_logs_tail(message.chat.id, message.from_user, source="command")
+
+    @bot.message_handler(commands=["feature_flags"])
+    def cmd_feature_flags(message):
+        if not is_admin(message.from_user.id):
+            return
+        parts = (message.text or "").split()
+        if len(parts) == 3:
+            name = parts[1].strip()
+            value = parts[2].strip().lower() in {"1", "on", "true", "yes"}
+            set_feature_flag(message.from_user, message.chat.id, name, value)
+            return
+        bot.send_message(message.chat.id, build_feature_flags_text())
 
     @bot.message_handler(commands=["shutdown"])
     def cmd_shutdown(message):
@@ -417,6 +520,11 @@ def main():
             log_admin_action(call.from_user, "stats", chat_id=call.message.chat.id)
             bot.send_message(call.message.chat.id, build_stats_text())
             return
+        if call.data == "admin:analytics" and is_admin(call.from_user.id):
+            wizard._load_users_payload()
+            log_admin_action(call.from_user, "analytics", chat_id=call.message.chat.id)
+            bot.send_message(call.message.chat.id, build_analytics_text())
+            return
         if call.data == "admin:health" and is_admin(call.from_user.id):
             log_admin_action(call.from_user, "health", chat_id=call.message.chat.id)
             bot.send_message(call.message.chat.id, build_health_text())
@@ -460,6 +568,16 @@ def main():
             return
         if call.data == "admin:download_logs" and is_admin(call.from_user.id):
             send_logs_to_admin(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:users_export" and is_admin(call.from_user.id):
+            wizard._load_users_payload()
+            send_users_export(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:logs_tail" and is_admin(call.from_user.id):
+            send_logs_tail(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:feature_flags" and is_admin(call.from_user.id):
+            bot.send_message(call.message.chat.id, build_feature_flags_text())
             return
         if call.data == "admin:shutdown" and is_admin(call.from_user.id):
             log_admin_action(call.from_user, "shutdown", chat_id=call.message.chat.id)

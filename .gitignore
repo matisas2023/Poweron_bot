@@ -9,3 +9,6 @@ data/users.json
 poweron_admin_user_id.txt
 
 logs/*.log
+
+data/users.sqlite
+data/*.sqlite
