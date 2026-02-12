@@ -54,18 +54,27 @@ def parse_admin_id(raw_value: str):
 
 def admin_keyboard() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("📊 /stats", callback_data="admin:stats"))
-    kb.add(types.InlineKeyboardButton("📈 /analytics", callback_data="admin:analytics"))
-    kb.add(types.InlineKeyboardButton("🩺 /health", callback_data="admin:health"))
-    kb.add(types.InlineKeyboardButton("📣 /broadcast", callback_data="admin:broadcast"))
-    kb.add(types.InlineKeyboardButton("🧪 /selftest_logs", callback_data="admin:selftest_logs"))
-    kb.add(types.InlineKeyboardButton("🖼 /selftest_plot", callback_data="admin:selftest_plot"))
-    kb.add(types.InlineKeyboardButton("📥 /download_logs", callback_data="admin:download_logs"))
-    kb.add(types.InlineKeyboardButton("👥 /users_export", callback_data="admin:users_export"))
-    kb.add(types.InlineKeyboardButton("📄 /logs_tail", callback_data="admin:logs_tail"))
-    kb.add(types.InlineKeyboardButton("🎛 /feature_flags", callback_data="admin:feature_flags"))
-    kb.add(types.InlineKeyboardButton("🛑 /shutdown", callback_data="admin:shutdown"))
-    kb.add(types.InlineKeyboardButton("🔄 /restart", callback_data="admin:restart"))
+    kb.add(types.InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"))
+    kb.add(types.InlineKeyboardButton("📈 Аналітика", callback_data="admin:analytics"))
+    kb.add(types.InlineKeyboardButton("🩺 Стан сервісу", callback_data="admin:health"))
+    kb.add(types.InlineKeyboardButton("📣 Розсилка", callback_data="admin:broadcast"))
+    kb.add(types.InlineKeyboardButton("🧪 Self-test логів", callback_data="admin:selftest_logs"))
+    kb.add(types.InlineKeyboardButton("🖼 Self-test графіка", callback_data="admin:selftest_plot"))
+    kb.add(types.InlineKeyboardButton("📥 Завантажити логи", callback_data="admin:download_logs"))
+    kb.add(types.InlineKeyboardButton("👥 Експорт користувачів", callback_data="admin:users_export"))
+    kb.add(types.InlineKeyboardButton("📄 Останні записи логів", callback_data="admin:logs_tail"))
+    kb.add(types.InlineKeyboardButton("🎛 Прапорці функцій", callback_data="admin:feature_flags"))
+    kb.add(types.InlineKeyboardButton("🛑 Вимкнути сервер", callback_data="admin:shutdown"))
+    kb.add(types.InlineKeyboardButton("🔄 Перезапустити сервер", callback_data="admin:restart"))
+    return kb
+
+
+def feature_flags_keyboard(flags: dict) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for key, value in sorted(flags.items()):
+        status_icon = "🟢" if value else "⚪️"
+        kb.add(types.InlineKeyboardButton(f"{status_icon} {key}", callback_data=f"admin:feature_toggle:{key}"))
+    kb.add(types.InlineKeyboardButton("🔙 До адмін-меню", callback_data="admin:menu"))
     return kb
 
 
@@ -348,10 +357,10 @@ def main():
 
     def build_feature_flags_text() -> str:
         flags = wizard.feature_flags
-        lines = ["🎛 Feature flags:"]
+        lines = ["🎛 Прапорці функцій:"]
         for key, value in sorted(flags.items()):
-            lines.append(f"• {key} = {'ON' if value else 'OFF'}")
-        lines.append("\nПеремкнути: /feature_flags <name> <on|off>")
+            lines.append(f"• {key}: {'Увімкнено' if value else 'Вимкнено'}")
+        lines.append("\nМожна перемкнути через інлайн-меню або командою /feature_flags <name> <on|off>")
         return "\n".join(lines)
 
     def set_feature_flag(user, chat_id: int, name: str, value: bool):
@@ -360,7 +369,11 @@ def main():
             return
         wizard.feature_flags[name] = value
         log_admin_action(user, "feature_flag_set", f"{name}={value}", chat_id=chat_id)
-        bot.send_message(chat_id, f"✅ {name} => {'ON' if value else 'OFF'}")
+        bot.send_message(
+            chat_id,
+            f"✅ {name}: {'Увімкнено' if value else 'Вимкнено'}",
+            reply_markup=feature_flags_keyboard(wizard.feature_flags),
+        )
 
     @bot.message_handler(commands=["start"])
     def cmd_start(message):
@@ -465,7 +478,11 @@ def main():
             value = parts[2].strip().lower() in {"1", "on", "true", "yes"}
             set_feature_flag(message.from_user, message.chat.id, name, value)
             return
-        bot.send_message(message.chat.id, build_feature_flags_text())
+        bot.send_message(
+            message.chat.id,
+            build_feature_flags_text(),
+            reply_markup=feature_flags_keyboard(wizard.feature_flags),
+        )
 
     @bot.message_handler(commands=["shutdown"])
     def cmd_shutdown(message):
@@ -516,6 +533,9 @@ def main():
         if allowed_ids and call.from_user.id not in allowed_ids:
             return
 
+        if call.data == "admin:menu" and is_admin(call.from_user.id):
+            bot.send_message(call.message.chat.id, "🛠 Адмін-меню:", reply_markup=admin_keyboard())
+            return
         if call.data == "admin:stats" and is_admin(call.from_user.id):
             log_admin_action(call.from_user, "stats", chat_id=call.message.chat.id)
             bot.send_message(call.message.chat.id, build_stats_text())
@@ -577,7 +597,31 @@ def main():
             send_logs_tail(call.message.chat.id, call.from_user, source="callback")
             return
         if call.data == "admin:feature_flags" and is_admin(call.from_user.id):
-            bot.send_message(call.message.chat.id, build_feature_flags_text())
+            bot.send_message(
+                call.message.chat.id,
+                build_feature_flags_text(),
+                reply_markup=feature_flags_keyboard(wizard.feature_flags),
+            )
+            return
+        if call.data.startswith("admin:feature_toggle:") and is_admin(call.from_user.id):
+            flag_name = call.data.split(":", 2)[2]
+            if flag_name not in wizard.feature_flags:
+                bot.answer_callback_query(call.id, "Невідомий прапорець")
+                return
+            wizard.feature_flags[flag_name] = not wizard.feature_flags[flag_name]
+            log_admin_action(
+                call.from_user,
+                "feature_flag_toggle",
+                f"{flag_name}={wizard.feature_flags[flag_name]} source=inline",
+                chat_id=call.message.chat.id,
+            )
+            bot.edit_message_text(
+                build_feature_flags_text(),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=feature_flags_keyboard(wizard.feature_flags),
+            )
+            bot.answer_callback_query(call.id, f"{flag_name}: {'ON' if wizard.feature_flags[flag_name] else 'OFF'}")
             return
         if call.data == "admin:shutdown" and is_admin(call.from_user.id):
             log_admin_action(call.from_user, "shutdown", chat_id=call.message.chat.id)
