@@ -2,20 +2,29 @@ import asyncio
 import logging
 import os
 import sys
+import csv
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import telebot
 from telebot import types
 
+from poweron_bot.logging_setup import get_admin_logger, get_user_logger
+from poweron_bot.paths import ADMIN_ID_FILE, BASE_DIR, LOGS_DIR, TMP_DIR
 from poweron_bot.wizard import PowerOnWizard
 
 
-def load_token_from_file(path="bot_token.txt"):
-    if not os.path.exists(path):
+def load_token_from_file(path: Path):
+    if not path.exists():
         return None
-    with open(path, "r", encoding="utf-8") as token_file:
+    with path.open("r", encoding="utf-8") as token_file:
         content = token_file.read().strip()
         return content or None
 
@@ -43,37 +52,29 @@ def parse_admin_id(raw_value: str):
         return None
 
 
-def setup_user_logger() -> logging.Logger:
-    os.makedirs("logs", exist_ok=True)
-    user_logger = logging.getLogger("poweron_user_entries")
-    user_logger.setLevel(logging.INFO)
-    user_logger.propagate = False
-    if not user_logger.handlers:
-        handler = logging.FileHandler("logs/user_entries.log", encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-        user_logger.addHandler(handler)
-    return user_logger
-
-
-def setup_admin_logger() -> logging.Logger:
-    os.makedirs("logs", exist_ok=True)
-    admin_logger = logging.getLogger("poweron_admin_actions")
-    admin_logger.setLevel(logging.INFO)
-    admin_logger.propagate = False
-    if not admin_logger.handlers:
-        handler = logging.FileHandler("logs/admin_actions.log", encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-        admin_logger.addHandler(handler)
-    return admin_logger
-
-
 def admin_keyboard() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("📊 /stats", callback_data="admin:stats"))
-    kb.add(types.InlineKeyboardButton("🩺 /health", callback_data="admin:health"))
-    kb.add(types.InlineKeyboardButton("📣 /broadcast", callback_data="admin:broadcast"))
-    kb.add(types.InlineKeyboardButton("🛑 /shutdown", callback_data="admin:shutdown"))
-    kb.add(types.InlineKeyboardButton("🔄 /restart", callback_data="admin:restart"))
+    kb.add(types.InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"))
+    kb.add(types.InlineKeyboardButton("📈 Аналітика", callback_data="admin:analytics"))
+    kb.add(types.InlineKeyboardButton("🩺 Стан сервісу", callback_data="admin:health"))
+    kb.add(types.InlineKeyboardButton("📣 Розсилка", callback_data="admin:broadcast"))
+    kb.add(types.InlineKeyboardButton("🧪 Self-test логів", callback_data="admin:selftest_logs"))
+    kb.add(types.InlineKeyboardButton("🖼 Self-test графіка", callback_data="admin:selftest_plot"))
+    kb.add(types.InlineKeyboardButton("📥 Завантажити логи", callback_data="admin:download_logs"))
+    kb.add(types.InlineKeyboardButton("👥 Експорт користувачів", callback_data="admin:users_export"))
+    kb.add(types.InlineKeyboardButton("📄 Останні записи логів", callback_data="admin:logs_tail"))
+    kb.add(types.InlineKeyboardButton("🎛 Прапорці функцій", callback_data="admin:feature_flags"))
+    kb.add(types.InlineKeyboardButton("🛑 Вимкнути сервер", callback_data="admin:shutdown"))
+    kb.add(types.InlineKeyboardButton("🔄 Перезапустити сервер", callback_data="admin:restart"))
+    return kb
+
+
+def feature_flags_keyboard(flags: dict) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for key, value in sorted(flags.items()):
+        status_icon = "🟢" if value else "⚪️"
+        kb.add(types.InlineKeyboardButton(f"{status_icon} {key}", callback_data=f"admin:feature_toggle:{key}"))
+    kb.add(types.InlineKeyboardButton("🔙 До адмін-меню", callback_data="admin:menu"))
     return kb
 
 
@@ -89,18 +90,18 @@ def broadcast_confirm_keyboard() -> types.InlineKeyboardMarkup:
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    token = os.getenv("POWERON_BOT_TOKEN") or load_token_from_file("poweron_bot_token.txt")
+    token = os.getenv("POWERON_BOT_TOKEN") or load_token_from_file(BASE_DIR / "poweron_bot_token.txt")
     if not token:
         raise RuntimeError("Set POWERON_BOT_TOKEN or create poweron_bot_token.txt")
 
-    admin_id_raw = os.getenv("POWERON_ADMIN_USER_ID") or load_token_from_file("poweron_admin_user_id.txt")
+    admin_id_raw = os.getenv("POWERON_ADMIN_USER_ID") or load_token_from_file(ADMIN_ID_FILE)
     admin_user_id = parse_admin_id(admin_id_raw)
 
     allowed_ids = parse_allowed_ids(os.getenv("POWERON_ALLOWED_IDS", ""))
     bot = telebot.TeleBot(token)
     wizard = PowerOnWizard(bot)
-    user_logger = setup_user_logger()
-    admin_logger = setup_admin_logger()
+    user_logger = get_user_logger()
+    admin_logger = get_admin_logger()
     admin_broadcast_pending = set()
     admin_broadcast_draft = {}
 
@@ -166,6 +167,73 @@ def main():
             f"• Режим: {mode}\n"
             f"• Остання адреса: {last_address}"
         )
+
+    def create_test_plot(chat_id: int) -> Path:
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix="poweron_test_plot_", suffix=".png", dir=TMP_DIR, delete=False) as tmp_file:
+            image_path = Path(tmp_file.name)
+
+        x_values = [0, 1, 2, 3, 4]
+        y_values = [2, 1, 3, 2, 4]
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(x_values, y_values, marker="o")
+        ax.set_title("PowerOn test графік")
+        ax.set_xlabel("Крок")
+        ax.set_ylabel("Рівень")
+        ax.grid(True, linestyle="--", alpha=0.4)
+        fig.tight_layout()
+        fig.savefig(image_path, dpi=150)
+        plt.close(fig)
+
+        user_logger.info("user_action=test_plot_generated chat_id=%s file=%s", chat_id, image_path)
+        return image_path
+
+    def send_logs_to_admin(chat_id: int, user, source: str):
+        sent_count = 0
+        missing_files = []
+        for log_file in (LOGS_DIR / "admin_actions.log", LOGS_DIR / "user_entries.log"):
+            if not log_file.exists():
+                missing_files.append(log_file.name)
+                continue
+            with log_file.open("rb") as fh:
+                bot.send_document(chat_id, fh, visible_file_name=log_file.name, caption=f"📥 Лог: {log_file.name}")
+            sent_count += 1
+
+        details = f"source={source} sent={sent_count} missing={','.join(missing_files) if missing_files else '-'}"
+        log_admin_action(user, "download_logs", details, chat_id=chat_id)
+
+        if sent_count == 0:
+            bot.send_message(chat_id, "⚠️ Лог-файли поки що відсутні. Спробуйте /selftest_logs і повторіть.")
+        elif missing_files:
+            bot.send_message(chat_id, f"✅ Надіслано {sent_count} лог(и). Відсутні: {', '.join(missing_files)}")
+
+    def run_selftest_logs(chat_id: int, user, source: str, message=None):
+        log_admin_action(user, "selftest_logs", f"source={source}", chat_id=chat_id)
+        if message is not None:
+            log_user_action(message, "selftest_logs")
+        else:
+            user_logger.info(
+                "user_action=selftest_logs chat_id=%s user_id=%s username=%s details=%s",
+                chat_id,
+                getattr(user, "id", None),
+                getattr(user, "username", None),
+                f"source={source}",
+            )
+        bot.send_message(chat_id, "✅ Тестові записи додані в admin_actions.log і user_entries.log")
+
+    def run_selftest_plot(chat_id: int, user, source: str):
+        image_path = None
+        try:
+            image_path = create_test_plot(chat_id)
+            with image_path.open("rb") as image_file:
+                bot.send_photo(chat_id, image_file, caption="🧪 Тестовий PNG-графік (headless/Agg)")
+            log_admin_action(user, "selftest_plot", f"source={source} file={image_path.name}", chat_id=chat_id)
+        except Exception as exc:
+            user_logger.exception("user_action=selftest_plot_failed chat_id=%s error=%s", chat_id, exc)
+            bot.send_message(chat_id, "❌ Не вдалося згенерувати тестовий графік.")
+        finally:
+            if image_path and image_path.exists():
+                image_path.unlink(missing_ok=True)
 
     def schedule_shutdown():
         def _stop():
@@ -238,6 +306,75 @@ def main():
             + (f"\n• API error: {api_error}" if api_error else "")
         )
 
+    def build_analytics_text() -> str:
+        snapshot = wizard.health_snapshot()
+        wizard_metrics = snapshot.get("wizard", {})
+        client_metrics = snapshot.get("client", {})
+        users_total = len(wizard._users_payload)
+        dau = sum(1 for item in wizard._users_payload.values() if item.get("seen"))
+        return (
+            "📈 Analytics\n"
+            f"• Users total: {users_total}\n"
+            f"• Active seen users: {dau}\n"
+            f"• schedule req/success/fail: {wizard_metrics.get('schedule_requests', 0)}/{wizard_metrics.get('schedule_success', 0)}/{wizard_metrics.get('schedule_failures', 0)}\n"
+            f"• auto notifications: {wizard_metrics.get('auto_update_notifications', 0)}\n"
+            f"• render fail: {client_metrics.get('render_failures', 0)}\n"
+            f"• last render ms: {wizard_metrics.get('last_render_ms', 0)}"
+        )
+
+    def send_users_export(chat_id: int, user, source: str):
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        export_path = TMP_DIR / "users_export.csv"
+        with export_path.open("w", encoding="utf-8", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["chat_id", "seen", "history_count", "pinned_count", "auto_enabled", "auto_interval", "silent"])
+            for chat_id_str, payload in wizard._users_payload.items():
+                auto = payload.get("auto_update") or {}
+                writer.writerow([
+                    chat_id_str,
+                    int(bool(payload.get("seen"))),
+                    len(payload.get("history") or []),
+                    len(payload.get("pinned") or []),
+                    int(bool(auto.get("enabled"))),
+                    int(auto.get("interval", 60) or 60),
+                    int(bool(auto.get("silent", True))),
+                ])
+        with export_path.open("rb") as csv_file:
+            bot.send_document(chat_id, csv_file, visible_file_name="users_export.csv", caption="👥 Експорт користувачів")
+        log_admin_action(user, "users_export", f"source={source}", chat_id=chat_id)
+
+    def send_logs_tail(chat_id: int, user, source: str, lines: int = 100):
+        snippets = []
+        for log_file in (LOGS_DIR / "admin_actions.log", LOGS_DIR / "user_entries.log"):
+            if not log_file.exists():
+                snippets.append(f"{log_file.name}: файл відсутній")
+                continue
+            content = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-lines:]
+            snippets.append(f"{log_file.name}:\n" + "\n".join(content[-20:]))
+        text_payload = "\n\n".join(snippets)[:3800]
+        bot.send_message(chat_id, f"📄 Останні записи логів:\n\n{text_payload}")
+        log_admin_action(user, "logs_tail", f"source={source} lines={lines}", chat_id=chat_id)
+
+    def build_feature_flags_text() -> str:
+        flags = wizard.feature_flags
+        lines = ["🎛 Прапорці функцій:"]
+        for key, value in sorted(flags.items()):
+            lines.append(f"• {key}: {'Увімкнено' if value else 'Вимкнено'}")
+        lines.append("\nМожна перемкнути через інлайн-меню або командою /feature_flags <name> <on|off>")
+        return "\n".join(lines)
+
+    def set_feature_flag(user, chat_id: int, name: str, value: bool):
+        if name not in wizard.feature_flags:
+            bot.send_message(chat_id, f"Невідомий feature flag: {name}")
+            return
+        wizard.feature_flags[name] = value
+        log_admin_action(user, "feature_flag_set", f"{name}={value}", chat_id=chat_id)
+        bot.send_message(
+            chat_id,
+            f"✅ {name}: {'Увімкнено' if value else 'Вимкнено'}",
+            reply_markup=feature_flags_keyboard(wizard.feature_flags),
+        )
+
     @bot.message_handler(commands=["start"])
     def cmd_start(message):
         user = message.from_user
@@ -277,6 +414,14 @@ def main():
         log_admin_action(message.from_user, "stats", chat_id=message.chat.id)
         bot.send_message(message.chat.id, build_stats_text())
 
+    @bot.message_handler(commands=["analytics"])
+    def cmd_analytics(message):
+        if not is_admin(message.from_user.id):
+            return
+        wizard._load_users_payload()
+        log_admin_action(message.from_user, "analytics", chat_id=message.chat.id)
+        bot.send_message(message.chat.id, build_analytics_text())
+
     @bot.message_handler(commands=["health"])
     def cmd_health(message):
         if not is_admin(message.from_user.id):
@@ -291,6 +436,53 @@ def main():
         log_admin_action(message.from_user, "broadcast_start", chat_id=message.chat.id)
         admin_broadcast_pending.add(message.chat.id)
         bot.send_message(message.chat.id, "📣 Введіть текст для розсилки всім користувачам:")
+
+    @bot.message_handler(commands=["selftest_logs"])
+    def cmd_selftest_logs(message):
+        if not is_admin(message.from_user.id):
+            return
+        run_selftest_logs(message.chat.id, message.from_user, source="command", message=message)
+
+    @bot.message_handler(commands=["selftest_plot"])
+    def cmd_selftest_plot(message):
+        if not is_admin(message.from_user.id):
+            return
+        run_selftest_plot(message.chat.id, message.from_user, source="command")
+
+    @bot.message_handler(commands=["download_logs"])
+    def cmd_download_logs(message):
+        if not is_admin(message.from_user.id):
+            return
+        send_logs_to_admin(message.chat.id, message.from_user, source="command")
+
+    @bot.message_handler(commands=["users_export"])
+    def cmd_users_export(message):
+        if not is_admin(message.from_user.id):
+            return
+        wizard._load_users_payload()
+        send_users_export(message.chat.id, message.from_user, source="command")
+
+    @bot.message_handler(commands=["logs_tail"])
+    def cmd_logs_tail(message):
+        if not is_admin(message.from_user.id):
+            return
+        send_logs_tail(message.chat.id, message.from_user, source="command")
+
+    @bot.message_handler(commands=["feature_flags"])
+    def cmd_feature_flags(message):
+        if not is_admin(message.from_user.id):
+            return
+        parts = (message.text or "").split()
+        if len(parts) == 3:
+            name = parts[1].strip()
+            value = parts[2].strip().lower() in {"1", "on", "true", "yes"}
+            set_feature_flag(message.from_user, message.chat.id, name, value)
+            return
+        bot.send_message(
+            message.chat.id,
+            build_feature_flags_text(),
+            reply_markup=feature_flags_keyboard(wizard.feature_flags),
+        )
 
     @bot.message_handler(commands=["shutdown"])
     def cmd_shutdown(message):
@@ -341,9 +533,17 @@ def main():
         if allowed_ids and call.from_user.id not in allowed_ids:
             return
 
+        if call.data == "admin:menu" and is_admin(call.from_user.id):
+            bot.send_message(call.message.chat.id, "🛠 Адмін-меню:", reply_markup=admin_keyboard())
+            return
         if call.data == "admin:stats" and is_admin(call.from_user.id):
             log_admin_action(call.from_user, "stats", chat_id=call.message.chat.id)
             bot.send_message(call.message.chat.id, build_stats_text())
+            return
+        if call.data == "admin:analytics" and is_admin(call.from_user.id):
+            wizard._load_users_payload()
+            log_admin_action(call.from_user, "analytics", chat_id=call.message.chat.id)
+            bot.send_message(call.message.chat.id, build_analytics_text())
             return
         if call.data == "admin:health" and is_admin(call.from_user.id):
             log_admin_action(call.from_user, "health", chat_id=call.message.chat.id)
@@ -379,6 +579,49 @@ def main():
             admin_broadcast_draft.pop(call.message.chat.id, None)
             log_admin_action(call.from_user, "broadcast_cancel", chat_id=call.message.chat.id)
             bot.send_message(call.message.chat.id, "❌ Розсилку скасовано.")
+            return
+        if call.data == "admin:selftest_logs" and is_admin(call.from_user.id):
+            run_selftest_logs(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:selftest_plot" and is_admin(call.from_user.id):
+            run_selftest_plot(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:download_logs" and is_admin(call.from_user.id):
+            send_logs_to_admin(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:users_export" and is_admin(call.from_user.id):
+            wizard._load_users_payload()
+            send_users_export(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:logs_tail" and is_admin(call.from_user.id):
+            send_logs_tail(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:feature_flags" and is_admin(call.from_user.id):
+            bot.send_message(
+                call.message.chat.id,
+                build_feature_flags_text(),
+                reply_markup=feature_flags_keyboard(wizard.feature_flags),
+            )
+            return
+        if call.data.startswith("admin:feature_toggle:") and is_admin(call.from_user.id):
+            flag_name = call.data.split(":", 2)[2]
+            if flag_name not in wizard.feature_flags:
+                bot.answer_callback_query(call.id, "Невідомий прапорець")
+                return
+            wizard.feature_flags[flag_name] = not wizard.feature_flags[flag_name]
+            log_admin_action(
+                call.from_user,
+                "feature_flag_toggle",
+                f"{flag_name}={wizard.feature_flags[flag_name]} source=inline",
+                chat_id=call.message.chat.id,
+            )
+            bot.edit_message_text(
+                build_feature_flags_text(),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=feature_flags_keyboard(wizard.feature_flags),
+            )
+            bot.answer_callback_query(call.id, f"{flag_name}: {'ON' if wizard.feature_flags[flag_name] else 'OFF'}")
             return
         if call.data == "admin:shutdown" and is_admin(call.from_user.id):
             log_admin_action(call.from_user, "shutdown", chat_id=call.message.chat.id)
