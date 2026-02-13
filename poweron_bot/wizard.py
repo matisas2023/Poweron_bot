@@ -284,22 +284,21 @@ class PowerOnWizard:
         return kb
 
     def _home_keyboard(self):
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
         kb.add(
-            types.KeyboardButton("⚡ Перевірити графік"),
-            types.KeyboardButton("📌 Мої адреси"),
+            types.KeyboardButton("⚡ Графік"),
+            types.KeyboardButton("📌 Адреси"),
+            types.KeyboardButton("🕘 Історія"),
         )
         kb.add(
-            types.KeyboardButton("🕘 Недавні"),
-            types.KeyboardButton("🎛 Налаштування"),
-        )
-        kb.add(
+            types.KeyboardButton("🎛 Налашт."),
             types.KeyboardButton("📡 Статус"),
             types.KeyboardButton("❓ FAQ"),
         )
         kb.add(
-            types.KeyboardButton("⭐ Оцінити бота"),
-            types.KeyboardButton("📝 Зворотній зв'язок"),
+            types.KeyboardButton("⭐ Оцінка"),
+            types.KeyboardButton("📝 Відгук"),
+            types.KeyboardButton("🏠 Додому"),
         )
         kb.add(types.KeyboardButton("🏠 Додому"))
         return kb
@@ -547,11 +546,11 @@ class PowerOnWizard:
         session = self.state.get(chat_id)
         text = (message.text or "").strip()
 
-        if text in {"💡 Графік світла (за адресою)", "💡 Графік світла", "⚡ Перевірити графік"}:
+        if text in {"💡 Графік світла (за адресою)", "💡 Графік світла", "⚡ Перевірити графік", "⚡ Графік"}:
             self.start(chat_id)
             return True
 
-        if text in {"📌 Закріплені", "📌 Мої адреси"}:
+        if text in {"📌 Закріплені", "📌 Мої адреси", "📌 Адреси"}:
             pinned_kb = self._pinned_keyboard(chat_id)
             if not pinned_kb:
                 self.bot.send_message(chat_id, "Немає закріплених адрес. Закріпіть адресу з історії.")
@@ -567,7 +566,7 @@ class PowerOnWizard:
                 self.bot.send_message(chat_id, "🕘 Останні 6 адрес. Можна відкрити або закріпити:", reply_markup=history_kb)
             return True
 
-        if text in {"⚙️ Налаштування", "🎛 Налаштування"}:
+        if text in {"⚙️ Налаштування", "🎛 Налаштування", "🎛 Налашт."}:
             self.state.pop(chat_id, None)
             self.send_settings(chat_id)
             return True
@@ -580,12 +579,12 @@ class PowerOnWizard:
             self.bot.send_message(chat_id, self._faq_text(), reply_markup=self._home_keyboard())
             return True
 
-        if text in {"⭐ Оцінити бота"}:
+        if text in {"⭐ Оцінити бота", "⭐ Оцінка"}:
             self.state[chat_id] = {"step": "rating_input"}
             self.bot.send_message(chat_id, "⭐ Оцініть бота від 1 до 5 (надішліть лише число).")
             return True
 
-        if text in {"📝 Зворотній зв'язок"}:
+        if text in {"📝 Зворотній зв'язок", "📝 Відгук"}:
             self.state[chat_id] = {"step": "feedback_input"}
             self.bot.send_message(chat_id, "📝 Напишіть ваш відгук одним повідомленням. Ми врахуємо його в наступних оновленнях.")
             return True
