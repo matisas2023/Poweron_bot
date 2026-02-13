@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from telebot import types
 
@@ -687,6 +687,31 @@ class PowerOnWizard:
     def _entry_signature(entry: dict) -> str:
         return entry.get("cache_key", "")
 
+    @staticmethod
+    def _entry_ids(entry: dict) -> Optional[Tuple[int, int, int]]:
+        cache_key = (entry or {}).get("cache_key", "")
+        if not cache_key:
+            return None
+        try:
+            settlement_id, street_id, house_id = cache_key.split(":")
+            return int(settlement_id), int(street_id), int(house_id)
+        except (TypeError, ValueError):
+            return None
+
+    def _refresh_entry_schedule(self, entry: dict) -> dict:
+        entry = dict(entry or {})
+        ids = self._entry_ids(entry)
+        if not ids:
+            return entry
+
+        try:
+            schedule = asyncio.run(self.client.fetch_house_schedule(*ids))
+            if schedule:
+                entry["schedule"] = schedule
+        except Exception as exc:
+            self.logger.warning("poweron.schedule_refresh_failed cache_key=%s error=%s", entry.get("cache_key", ""), exc)
+        return entry
+
     # ---------------------- auto update worker ----------------------
     def _schedule_auto_update(self, chat_id: int):
         settings = self.auto_update.get(chat_id) or {}
@@ -768,7 +793,7 @@ class PowerOnWizard:
                 always_notify = not settings.get("silent", True)
 
                 if (changed or always_notify) and self._can_notify_now(settings):
-                    self._deliver_schedule(chat_id, image_path, entry, item.get("schedule", {}), auto=True)
+                    self._deliver_schedule(chat_id, image_path, entry, entry.get("schedule", {}), auto=True)
                     self.metrics["auto_update_notifications"] += 1
                     settings["notify_timestamps"] = (settings.get("notify_timestamps") or []) + [time.time()]
                     signatures[entry_key] = signature
@@ -803,12 +828,13 @@ class PowerOnWizard:
             return None
 
         if address_item:
-            settlement_render = address_item.get("settlement_render") or address_item.get("settlement_name")
-            settlement_display = address_item.get("settlement_display") or address_item.get("settlement_name")
-            street_name = address_item["street_name"]
-            house_name = address_item["house_name"]
-            cache_key = address_item["cache_key"]
-            schedule = address_item.get("schedule") or {}
+            normalized_item = self._refresh_entry_schedule(address_item)
+            settlement_render = normalized_item.get("settlement_render") or normalized_item.get("settlement_name")
+            settlement_display = normalized_item.get("settlement_display") or normalized_item.get("settlement_name")
+            street_name = normalized_item["street_name"]
+            house_name = normalized_item["house_name"]
+            cache_key = normalized_item["cache_key"]
+            schedule = normalized_item.get("schedule") or {}
         else:
             settlement = session.get("settlement")
             street = session.get("street")
@@ -844,6 +870,7 @@ class PowerOnWizard:
                 entry["street_name"],
                 entry["house_name"],
                 entry["cache_key"],
+                force_refresh=bool(address_item),
             )
         )
         self.metrics["last_render_ms"] = int((time.time() - started) * 1000)

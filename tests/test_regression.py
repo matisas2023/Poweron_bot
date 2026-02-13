@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import MethodType
 
 from poweron_bot.client import PowerOnClient, PowerOnClientError
 from poweron_bot.logging_setup import get_admin_logger, get_user_logger
@@ -49,6 +50,51 @@ class ClientTests(unittest.TestCase):
             else:
                 os.environ["POWERON_BROWSER_PATH"] = old
 
+    def test_fetch_house_schedule_returns_target_house(self):
+        client = PowerOnClient(cache_dir=tempfile.mkdtemp())
+
+        async def _fake_get_json(self, path, params=None):
+            assert path == "/pw_houses"
+            return {
+                "hydra:member": [
+                    {"id": 10, "chergGpv": "A"},
+                    {"id": 11, "chergGpv": "B", "chergGav": "2"},
+                ]
+            }
+
+        client._get_json = MethodType(_fake_get_json, client)
+        import asyncio
+
+        schedule = asyncio.run(client.fetch_house_schedule(1, 2, 11))
+        self.assertEqual(schedule["gpv"], "B")
+        self.assertEqual(schedule["gav"], "2")
+
+    def test_render_schedule_force_refresh_bypasses_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = PowerOnClient(cache_dir=tmp)
+            cache_key = "1:2:3"
+            image_path = os.path.join(tmp, "cached.png")
+            with open(image_path, "wb") as f:
+                f.write(b"cached")
+
+            from poweron_bot.client import CacheRecord
+
+            client._cache[cache_key] = CacheRecord(path=image_path, expires_at=10**10)
+
+            calls = {"n": 0}
+
+            async def _fake_capture(self, settlement_name, street_name, house_name, out_path):
+                calls["n"] += 1
+                with open(out_path, "wb") as out:
+                    out.write(b"fresh")
+
+            client._capture_from_site = MethodType(_fake_capture, client)
+            import asyncio
+
+            result = asyncio.run(client.render_schedule_screenshot("Town", "Street", "1", cache_key, force_refresh=True))
+            self.assertTrue(os.path.exists(result))
+            self.assertEqual(calls["n"], 1)
+
 
 class LoggingTests(unittest.TestCase):
     def test_logging_handlers_use_project_logs_dir(self):
@@ -80,6 +126,29 @@ class WizardFallbackTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(bot.messages), 1)
         self.assertEqual(wizard.metrics["text_fallbacks"], 1)
+
+    def test_build_entry_refreshes_schedule_from_api(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot)
+
+        async def _fake_fetch(settlement_id, street_id, house_id):
+            self.assertEqual((settlement_id, street_id, house_id), (1, 2, 3))
+            return {"gpv": "9", "gav": "8"}
+
+        wizard.client.fetch_house_schedule = _fake_fetch
+        entry = wizard._build_entry_from_context(
+            1,
+            {
+                "cache_key": "1:2:3",
+                "settlement_name": "Town",
+                "settlement_display": "Town",
+                "street_name": "Street",
+                "house_name": "1",
+                "schedule": {"gpv": "1"},
+            },
+        )
+
+        self.assertEqual(entry["schedule"]["gpv"], "9")
 
 
 if __name__ == "__main__":
