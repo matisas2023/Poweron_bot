@@ -210,6 +210,22 @@ class WizardFeedbackTests(unittest.TestCase):
             },
         )()
 
+
+    def test_user_can_rate_only_once(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot)
+
+        self.assertTrue(wizard.handle_message(self._message(11, "⭐ Оцінка")))
+        call_first = type("Call", (), {"data": "poweron:rate:4", "message": type("M", (), {"chat": type("C", (), {"id": 11})()})()})()
+        self.assertTrue(wizard.handle_callback(call_first))
+
+        call_second = type("Call", (), {"data": "poweron:rate:2", "message": type("M", (), {"chat": type("C", (), {"id": 11})()})()})()
+        self.assertTrue(wizard.handle_callback(call_second))
+
+        summary = wizard.get_rating_summary()
+        self.assertEqual(summary["distribution"]["4"], 1)
+        self.assertEqual(summary["distribution"]["2"], 0)
+
     def test_rating_and_feedback_flow(self):
         bot = DummyBot()
         wizard = PowerOnWizard(bot)

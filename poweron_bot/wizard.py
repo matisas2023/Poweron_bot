@@ -133,6 +133,11 @@ class PowerOnWizard:
             ratings[str(chat_id)] = {"rating": rating, "updated_at": int(time.time())}
         self._save_feedback_payload()
 
+    def has_user_rating(self, chat_id: int) -> bool:
+        with self._feedback_lock:
+            ratings = self._feedback_payload.get("ratings") or {}
+            return str(chat_id) in ratings
+
     def get_feedback_entries(self) -> List[dict]:
         with self._feedback_lock:
             entries = list(self._feedback_payload.get("entries") or [])
@@ -592,6 +597,9 @@ class PowerOnWizard:
             return True
 
         if text in {"⭐ Оцінити бота", "⭐ Оцінка"}:
+            if self.has_user_rating(chat_id):
+                self.bot.send_message(chat_id, "ℹ️ Ви вже залишили оцінку. Дякуємо!")
+                return True
             self.state.pop(chat_id, None)
             self.bot.send_message(chat_id, "⭐ Оберіть оцінку бота:", reply_markup=self._rating_keyboard())
             return True
@@ -616,6 +624,10 @@ class PowerOnWizard:
                 self.bot.send_message(chat_id, "Оцінка має бути в межах 1..5.")
                 return True
             user = getattr(message, "from_user", None)
+            if self.has_user_rating(chat_id):
+                self.state.pop(chat_id, None)
+                self.bot.send_message(chat_id, "ℹ️ Ви вже залишили оцінку. Дякуємо!", reply_markup=self._home_keyboard())
+                return True
             self.set_user_rating(chat_id, rating)
             self.state.pop(chat_id, None)
             self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard())
@@ -774,6 +786,9 @@ class PowerOnWizard:
             return True
 
         if data.startswith("poweron:rate:"):
+            if self.has_user_rating(chat_id):
+                self.bot.send_message(chat_id, "ℹ️ Ви вже залишили оцінку. Дякуємо!", reply_markup=self._home_keyboard())
+                return True
             try:
                 rating = int(data.rsplit(":", 1)[1])
             except ValueError:
