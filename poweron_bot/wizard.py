@@ -305,6 +305,7 @@ class PowerOnWizard:
             types.KeyboardButton("📝 Відгук"),
             types.KeyboardButton("🏠 Додому"),
         )
+        kb.add(types.KeyboardButton("🏠 Додому"))
         return kb
 
     @staticmethod
