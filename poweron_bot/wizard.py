@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from telebot import types
 
@@ -40,6 +40,11 @@ class PowerOnWizard:
         self.store = UserStateStore(self.user_state_db_file)
         self._users_payload = {}
         self._users_payload_lock = threading.Lock()
+
+        self.feedback_file = DATA_DIR / "feedback.json"
+        self._feedback_lock = threading.Lock()
+        self._feedback_payload = {"entries": [], "ratings": {}}
+        self._load_feedback_payload()
 
         self.feature_flags = {
             "analytics_enabled": True,
@@ -79,6 +84,71 @@ class PowerOnWizard:
             "failures": 0,
             "text_mode_until": 0,
         }
+
+    # ---------------------- feedback/rating ----------------------
+    def _load_feedback_payload(self):
+        with self._feedback_lock:
+            if self.feedback_file.exists():
+                try:
+                    with self.feedback_file.open("r", encoding="utf-8") as feedback_file:
+                        payload = json.load(feedback_file)
+                    if isinstance(payload, dict):
+                        self._feedback_payload = {
+                            "entries": payload.get("entries") or [],
+                            "ratings": payload.get("ratings") or {},
+                        }
+                except Exception as exc:
+                    self.logger.exception("poweron.feedback_load_failed error=%s", exc)
+
+    def _save_feedback_payload(self):
+        tmp_path = self.feedback_file.with_suffix(".json.tmp")
+        with self._feedback_lock:
+            try:
+                with tmp_path.open("w", encoding="utf-8") as feedback_file:
+                    json.dump(self._feedback_payload, feedback_file, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, self.feedback_file)
+            except Exception as exc:
+                self.logger.exception("poweron.feedback_save_failed error=%s", exc)
+
+    def add_feedback_entry(self, chat_id: int, text: str, username: str = "", first_name: str = ""):
+        clean_text = (text or "").strip()
+        if not clean_text:
+            return
+        with self._feedback_lock:
+            entries = self._feedback_payload.setdefault("entries", [])
+            entries.append({
+                "chat_id": int(chat_id),
+                "username": username or "",
+                "first_name": first_name or "",
+                "text": clean_text[:1500],
+                "created_at": int(time.time()),
+            })
+            self._feedback_payload["entries"] = entries[-500:]
+        self._save_feedback_payload()
+
+    def set_user_rating(self, chat_id: int, rating: int):
+        rating = max(1, min(5, int(rating)))
+        with self._feedback_lock:
+            ratings = self._feedback_payload.setdefault("ratings", {})
+            ratings[str(chat_id)] = {"rating": rating, "updated_at": int(time.time())}
+        self._save_feedback_payload()
+
+    def get_feedback_entries(self) -> List[dict]:
+        with self._feedback_lock:
+            entries = list(self._feedback_payload.get("entries") or [])
+        return entries
+
+    def get_rating_summary(self) -> dict:
+        with self._feedback_lock:
+            ratings = self._feedback_payload.get("ratings") or {}
+            values = [int((item or {}).get("rating", 0) or 0) for item in ratings.values()]
+        values = [v for v in values if 1 <= v <= 5]
+        if not values:
+            return {"count": 0, "average": 0.0, "distribution": {str(i): 0 for i in range(1, 6)}}
+        distribution = {str(i): 0 for i in range(1, 6)}
+        for v in values:
+            distribution[str(v)] += 1
+        return {"count": len(values), "average": round(sum(values) / len(values), 2), "distribution": distribution}
 
     # ---------------------- persistence ----------------------
     def _load_users_payload(self):
@@ -226,6 +296,10 @@ class PowerOnWizard:
         kb.add(
             types.KeyboardButton("📡 Статус"),
             types.KeyboardButton("❓ FAQ"),
+        )
+        kb.add(
+            types.KeyboardButton("⭐ Оцінити бота"),
+            types.KeyboardButton("📝 Зворотній зв'язок"),
         )
         kb.add(types.KeyboardButton("🏠 Додому"))
         return kb
@@ -379,6 +453,7 @@ class PowerOnWizard:
             "• Історія/закріплені: зберігається до 6 адрес в історії і до 6 закріплених.\n"
             "• Автооновлення: у «🎛 Налаштування» відкрийте автооновлення, увімкніть інтервал і виберіть адреси «📍 Адреси для автооновлення».\n"
             "• Тихий режим: надсилання лише при зміні графіка.\n"
+            "• Оцінка та відгук: кнопки «⭐ Оцінити бота» і «📝 Зворотній зв'язок» на головному екрані.\n"
             "• Якщо щось не працює: спробуйте повторити запит або відкрийте https://poweron.toe.com.ua/ вручну."
         )
 
@@ -505,9 +580,49 @@ class PowerOnWizard:
             self.bot.send_message(chat_id, self._faq_text(), reply_markup=self._home_keyboard())
             return True
 
+        if text in {"⭐ Оцінити бота"}:
+            self.state[chat_id] = {"step": "rating_input"}
+            self.bot.send_message(chat_id, "⭐ Оцініть бота від 1 до 5 (надішліть лише число).")
+            return True
+
+        if text in {"📝 Зворотній зв'язок"}:
+            self.state[chat_id] = {"step": "feedback_input"}
+            self.bot.send_message(chat_id, "📝 Напишіть ваш відгук одним повідомленням. Ми врахуємо його в наступних оновленнях.")
+            return True
+
         if text in {"🏠 Головна", "🏠 Додому"}:
             self.state.pop(chat_id, None)
             self.send_home(chat_id)
+            return True
+
+        if session and session.get("step") == "rating_input":
+            try:
+                rating = int(text)
+            except ValueError:
+                self.bot.send_message(chat_id, "Введіть число від 1 до 5.")
+                return True
+            if rating < 1 or rating > 5:
+                self.bot.send_message(chat_id, "Оцінка має бути в межах 1..5.")
+                return True
+            user = getattr(message, "from_user", None)
+            self.set_user_rating(chat_id, rating)
+            self.state.pop(chat_id, None)
+            self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard())
+            return True
+
+        if session and session.get("step") == "feedback_input":
+            if len(text) < 3:
+                self.bot.send_message(chat_id, "Будь ласка, додайте трохи більше деталей (мінімум 3 символи).")
+                return True
+            user = getattr(message, "from_user", None)
+            self.add_feedback_entry(
+                chat_id,
+                text,
+                username=getattr(user, "username", "") or "",
+                first_name=getattr(user, "first_name", "") or "",
+            )
+            self.state.pop(chat_id, None)
+            self.bot.send_message(chat_id, "✅ Дякуємо за відгук!", reply_markup=self._home_keyboard())
             return True
 
         if session and session.get("step") == "auto_interval_input":

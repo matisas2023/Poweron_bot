@@ -198,5 +198,33 @@ class WizardFallbackTests(unittest.TestCase):
         self.assertNotIn("ГАВ", body)
 
 
+class WizardFeedbackTests(unittest.TestCase):
+    def _message(self, chat_id: int, text: str, user_id: int = 1, username: str = "user"):
+        return type(
+            "Msg",
+            (),
+            {
+                "text": text,
+                "chat": type("Chat", (), {"id": chat_id})(),
+                "from_user": type("User", (), {"id": user_id, "username": username, "first_name": "Name"})(),
+            },
+        )()
+
+    def test_rating_and_feedback_flow(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot)
+
+        self.assertTrue(wizard.handle_message(self._message(10, "⭐ Оцінити бота")))
+        self.assertTrue(wizard.handle_message(self._message(10, "5")))
+        summary = wizard.get_rating_summary()
+        self.assertGreaterEqual(summary["count"], 1)
+
+        self.assertTrue(wizard.handle_message(self._message(10, "📝 Зворотній зв'язок")))
+        self.assertTrue(wizard.handle_message(self._message(10, "Все супер")))
+        entries = wizard.get_feedback_entries()
+        self.assertGreaterEqual(len(entries), 1)
+        self.assertEqual(entries[-1]["chat_id"], 10)
+
+
 if __name__ == "__main__":
     unittest.main()
