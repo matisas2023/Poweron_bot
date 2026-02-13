@@ -222,11 +222,38 @@ class PowerOnClient:
         except OSError:
             return
 
-    async def render_schedule_screenshot(self, settlement_name: str, street_name: str, house_name: str, cache_key: str) -> str:
+    @staticmethod
+    def _schedule_from_house_item(item: dict) -> dict:
+        return {
+            "gpv": item.get("chergGpv", "—"),
+            "gav": item.get("chergGav", "—"),
+            "achr": item.get("chergAchr", "—"),
+            "gvsp": item.get("chergGvsp", "—"),
+            "sgav": item.get("chergSgav", "—"),
+        }
+
+    async def fetch_house_schedule(self, settlement_id: int, street_id: int, house_id: int) -> Optional[dict]:
+        payload = await self._get_json(
+            "/pw_houses",
+            params={"pagination": "false", "city.id": settlement_id, "street.id": street_id},
+        )
+        for item in self._member_items(payload):
+            if int(item.get("id") or 0) == int(house_id):
+                return self._schedule_from_house_item(item)
+        return None
+
+    async def render_schedule_screenshot(
+        self,
+        settlement_name: str,
+        street_name: str,
+        house_name: str,
+        cache_key: str,
+        force_refresh: bool = False,
+    ) -> str:
         self._cleanup_cache_files()
         now = time.time()
         cached = self._cache.get(cache_key)
-        if cached and cached.expires_at > now and os.path.exists(cached.path):
+        if not force_refresh and cached and cached.expires_at > now and os.path.exists(cached.path):
             self.metrics["cache_hits"] += 1
             return cached.path
 
@@ -234,7 +261,7 @@ class PowerOnClient:
         lock = self._get_lock_for_current_loop(cache_key)
         async with lock:
             cached = self._cache.get(cache_key)
-            if cached and cached.expires_at > now and os.path.exists(cached.path):
+            if not force_refresh and cached and cached.expires_at > now and os.path.exists(cached.path):
                 self.metrics["cache_hits"] += 1
                 return cached.path
 
