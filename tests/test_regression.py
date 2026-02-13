@@ -150,6 +150,53 @@ class WizardFallbackTests(unittest.TestCase):
 
         self.assertEqual(entry["schedule"]["gpv"], "9")
 
+    def test_history_limit_is_six(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot)
+
+        for i in range(8):
+            wizard._upsert_history(1, {
+                "cache_key": f"1:2:{i}",
+                "settlement_display": "Town",
+                "street_name": "Street",
+                "house_name": str(i),
+            })
+
+        self.assertEqual(len(wizard.history[1]), 6)
+
+    def test_auto_update_can_select_specific_addresses(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot)
+        wizard.history[1] = [
+            {"cache_key": "1:2:3", "settlement_display": "A", "street_name": "S", "house_name": "1"},
+            {"cache_key": "1:2:4", "settlement_display": "B", "street_name": "S", "house_name": "2"},
+        ]
+        call = type("Call", (), {"data": "poweron:auto_addr:1:2:4", "message": type("M", (), {"chat": type("C", (), {"id": 1})()})()})()
+
+        handled = wizard.handle_callback(call)
+
+        self.assertTrue(handled)
+        self.assertIn("1:2:4", wizard.auto_update[1]["selected_keys"])
+
+    def test_deliver_schedule_shows_only_gpv(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot)
+        with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
+            tmp.write(b"x")
+            tmp.flush()
+            wizard._deliver_schedule(
+                1,
+                tmp.name,
+                {"settlement_display": "Town", "street_name": "Street", "house_name": "1"},
+                {"gpv": "7", "gav": "2"},
+                auto=False,
+            )
+
+        self.assertGreaterEqual(len(bot.messages), 1)
+        body = bot.messages[-1][1]
+        self.assertIn("ГПВ", body)
+        self.assertNotIn("ГАВ", body)
+
 
 if __name__ == "__main__":
     unittest.main()
