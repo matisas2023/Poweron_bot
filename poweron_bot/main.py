@@ -62,6 +62,9 @@ def admin_keyboard() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton("🖼 Self-test графіка", callback_data="admin:selftest_plot"))
     kb.add(types.InlineKeyboardButton("📥 Завантажити логи", callback_data="admin:download_logs"))
     kb.add(types.InlineKeyboardButton("👥 Експорт користувачів", callback_data="admin:users_export"))
+    kb.add(types.InlineKeyboardButton("📝 Відгуки (перегляд)", callback_data="admin:feedback_view"))
+    kb.add(types.InlineKeyboardButton("📥 Відгуки CSV", callback_data="admin:feedback_export"))
+    kb.add(types.InlineKeyboardButton("⭐ Загальна оцінка", callback_data="admin:ratings"))
     kb.add(types.InlineKeyboardButton("📄 Останні записи логів", callback_data="admin:logs_tail"))
     kb.add(types.InlineKeyboardButton("🎛 Прапорці функцій", callback_data="admin:feature_flags"))
     kb.add(types.InlineKeyboardButton("🛑 Вимкнути сервер", callback_data="admin:shutdown"))
@@ -375,6 +378,47 @@ def main():
             reply_markup=feature_flags_keyboard(wizard.feature_flags),
         )
 
+    def build_rating_text() -> str:
+        summary = wizard.get_rating_summary()
+        distribution = summary.get("distribution") or {}
+        return (
+            "⭐ Загальна оцінка бота\n"
+            f"• Кількість оцінок: {summary.get('count', 0)}\n"
+            f"• Середня оцінка: {summary.get('average', 0):.2f}/5\n"
+            f"• 5⭐: {distribution.get('5', 0)} | 4⭐: {distribution.get('4', 0)} | 3⭐: {distribution.get('3', 0)} | 2⭐: {distribution.get('2', 0)} | 1⭐: {distribution.get('1', 0)}"
+        )
+
+    def build_feedback_preview(limit: int = 10) -> str:
+        entries = wizard.get_feedback_entries()[-limit:]
+        if not entries:
+            return "📝 Відгуків поки немає."
+        lines = ["📝 Останні відгуки:"]
+        for item in reversed(entries):
+            created = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(item.get("created_at", 0) or 0)))
+            user_caption = item.get("username") or item.get("first_name") or str(item.get("chat_id"))
+            text_value = (item.get("text") or "").replace("\n", " ").strip()
+            lines.append(f"• [{created}] @{user_caption}: {text_value[:180]}")
+        return "\n".join(lines)
+
+    def send_feedback_export(chat_id: int, user, source: str):
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        export_path = TMP_DIR / "feedback_export.csv"
+        entries = wizard.get_feedback_entries()
+        with export_path.open("w", encoding="utf-8", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["created_at", "chat_id", "username", "first_name", "text"])
+            for item in entries:
+                writer.writerow([
+                    int(item.get("created_at", 0) or 0),
+                    int(item.get("chat_id", 0) or 0),
+                    item.get("username", ""),
+                    item.get("first_name", ""),
+                    item.get("text", ""),
+                ])
+        with export_path.open("rb") as csv_file:
+            bot.send_document(chat_id, csv_file, visible_file_name="feedback_export.csv", caption="📥 Експорт відгуків")
+        log_admin_action(user, "feedback_export", f"source={source} entries={len(entries)}", chat_id=chat_id)
+
     @bot.message_handler(commands=["start"])
     def cmd_start(message):
         user = message.from_user
@@ -461,6 +505,26 @@ def main():
             return
         wizard._load_users_payload()
         send_users_export(message.chat.id, message.from_user, source="command")
+
+    @bot.message_handler(commands=["feedback_view"])
+    def cmd_feedback_view(message):
+        if not is_admin(message.from_user.id):
+            return
+        log_admin_action(message.from_user, "feedback_view", chat_id=message.chat.id)
+        bot.send_message(message.chat.id, build_feedback_preview())
+
+    @bot.message_handler(commands=["feedback_export"])
+    def cmd_feedback_export(message):
+        if not is_admin(message.from_user.id):
+            return
+        send_feedback_export(message.chat.id, message.from_user, source="command")
+
+    @bot.message_handler(commands=["ratings"])
+    def cmd_ratings(message):
+        if not is_admin(message.from_user.id):
+            return
+        log_admin_action(message.from_user, "ratings", chat_id=message.chat.id)
+        bot.send_message(message.chat.id, build_rating_text())
 
     @bot.message_handler(commands=["logs_tail"])
     def cmd_logs_tail(message):
@@ -595,6 +659,17 @@ def main():
             return
         if call.data == "admin:logs_tail" and is_admin(call.from_user.id):
             send_logs_tail(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:feedback_view" and is_admin(call.from_user.id):
+            log_admin_action(call.from_user, "feedback_view", chat_id=call.message.chat.id)
+            bot.send_message(call.message.chat.id, build_feedback_preview())
+            return
+        if call.data == "admin:feedback_export" and is_admin(call.from_user.id):
+            send_feedback_export(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:ratings" and is_admin(call.from_user.id):
+            log_admin_action(call.from_user, "ratings", chat_id=call.message.chat.id)
+            bot.send_message(call.message.chat.id, build_rating_text())
             return
         if call.data == "admin:feature_flags" and is_admin(call.from_user.id):
             bot.send_message(

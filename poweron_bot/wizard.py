@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from telebot import types
 
@@ -14,8 +14,8 @@ from poweron_bot.client import PowerOnClient, PowerOnClientError
 from poweron_bot.paths import DATA_DIR
 from poweron_bot.storage import UserStateStore
 
-MAX_HISTORY_ITEMS = 5
-MAX_PINNED_ITEMS = 5
+MAX_HISTORY_ITEMS = 6
+MAX_PINNED_ITEMS = 6
 AUTO_UPDATE_FAILURE_THRESHOLD = 3
 AUTO_UPDATE_COOLDOWN_SECONDS = 15 * 60
 
@@ -41,6 +41,11 @@ class PowerOnWizard:
         self._users_payload = {}
         self._users_payload_lock = threading.Lock()
 
+        self.feedback_file = DATA_DIR / "feedback.json"
+        self._feedback_lock = threading.Lock()
+        self._feedback_payload = {"entries": [], "ratings": {}}
+        self._load_feedback_payload()
+
         self.feature_flags = {
             "analytics_enabled": True,
             "multi_address_auto": True,
@@ -62,6 +67,88 @@ class PowerOnWizard:
 
         self._auto_update_worker_started = False
         self._start_auto_update_worker()
+
+    @staticmethod
+    def _default_auto_update_settings() -> dict:
+        return {
+            "enabled": False,
+            "interval": 60,
+            "silent": True,
+            "last_signature": "",
+            "last_signatures": {},
+            "selected_keys": [],
+            "next_run_ts": 0,
+            "quiet_hours": {"enabled": True, "start": 23, "end": 7},
+            "max_per_hour": 4,
+            "notify_timestamps": [],
+            "failures": 0,
+            "text_mode_until": 0,
+        }
+
+    # ---------------------- feedback/rating ----------------------
+    def _load_feedback_payload(self):
+        with self._feedback_lock:
+            if self.feedback_file.exists():
+                try:
+                    with self.feedback_file.open("r", encoding="utf-8") as feedback_file:
+                        payload = json.load(feedback_file)
+                    if isinstance(payload, dict):
+                        self._feedback_payload = {
+                            "entries": payload.get("entries") or [],
+                            "ratings": payload.get("ratings") or {},
+                        }
+                except Exception as exc:
+                    self.logger.exception("poweron.feedback_load_failed error=%s", exc)
+
+    def _save_feedback_payload(self):
+        tmp_path = self.feedback_file.with_suffix(".json.tmp")
+        with self._feedback_lock:
+            try:
+                with tmp_path.open("w", encoding="utf-8") as feedback_file:
+                    json.dump(self._feedback_payload, feedback_file, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, self.feedback_file)
+            except Exception as exc:
+                self.logger.exception("poweron.feedback_save_failed error=%s", exc)
+
+    def add_feedback_entry(self, chat_id: int, text: str, username: str = "", first_name: str = ""):
+        clean_text = (text or "").strip()
+        if not clean_text:
+            return
+        with self._feedback_lock:
+            entries = self._feedback_payload.setdefault("entries", [])
+            entries.append({
+                "chat_id": int(chat_id),
+                "username": username or "",
+                "first_name": first_name or "",
+                "text": clean_text[:1500],
+                "created_at": int(time.time()),
+            })
+            self._feedback_payload["entries"] = entries[-500:]
+        self._save_feedback_payload()
+
+    def set_user_rating(self, chat_id: int, rating: int):
+        rating = max(1, min(5, int(rating)))
+        with self._feedback_lock:
+            ratings = self._feedback_payload.setdefault("ratings", {})
+            ratings[str(chat_id)] = {"rating": rating, "updated_at": int(time.time())}
+        self._save_feedback_payload()
+
+    def get_feedback_entries(self) -> List[dict]:
+        with self._feedback_lock:
+            entries = list(self._feedback_payload.get("entries") or [])
+        return entries
+
+    def get_rating_summary(self) -> dict:
+        with self._feedback_lock:
+            ratings = self._feedback_payload.get("ratings") or {}
+            values = [int((item or {}).get("rating", 0) or 0) for item in ratings.values()]
+        values = [v for v in values if 1 <= v <= 5]
+        if not values:
+            return {"count": 0, "average": 0.0, "distribution": {str(i): 0 for i in range(1, 6)}}
+        distribution = {str(i): 0 for i in range(1, 6)}
+        for v in values:
+            distribution[str(v)] += 1
+        return {"count": len(values), "average": round(sum(values) / len(values), 2), "distribution": distribution}
 
     # ---------------------- persistence ----------------------
     def _load_users_payload(self):
@@ -120,24 +207,9 @@ class PowerOnWizard:
         payload_key = str(chat_id)
         self._users_payload[payload_key] = {
             "seen": chat_id in self.seen_users,
-            "history": self.history.get(chat_id, [])[:3],
+            "history": self.history.get(chat_id, [])[:MAX_HISTORY_ITEMS],
             "pinned": self.pinned.get(chat_id, [])[:MAX_PINNED_ITEMS],
-            "auto_update": self.auto_update.get(
-                chat_id,
-                {
-                    "enabled": False,
-                    "interval": 60,
-                    "silent": True,
-                    "last_signature": "",
-                    "last_signatures": {},
-                    "next_run_ts": 0,
-                    "quiet_hours": {"enabled": True, "start": 23, "end": 7},
-                    "max_per_hour": 4,
-                    "notify_timestamps": [],
-                    "failures": 0,
-                    "text_mode_until": 0,
-                },
-            ),
+            "auto_update": self.auto_update.get(chat_id, self._default_auto_update_settings()),
         }
         self.store.upsert_chat(chat_id, self._users_payload[payload_key])
         self._save_users_payload()
@@ -160,6 +232,7 @@ class PowerOnWizard:
                 "silent": bool(auto_update.get("silent", True)),
                 "last_signature": auto_update.get("last_signature", ""),
                 "last_signatures": auto_update.get("last_signatures", {}),
+                "selected_keys": auto_update.get("selected_keys", []),
                 "next_run_ts": float(auto_update.get("next_run_ts", 0) or 0),
                 "quiet_hours": auto_update.get("quiet_hours", {"enabled": True, "start": 23, "end": 7}),
                 "max_per_hour": int(auto_update.get("max_per_hour", 4) or 4),
@@ -188,6 +261,7 @@ class PowerOnWizard:
             "silent": bool(auto_update.get("silent", True)),
             "last_signature": auto_update.get("last_signature", ""),
             "last_signatures": auto_update.get("last_signatures", {}),
+            "selected_keys": auto_update.get("selected_keys", []),
             "next_run_ts": float(auto_update.get("next_run_ts", 0) or 0),
             "quiet_hours": auto_update.get("quiet_hours", {"enabled": True, "start": 23, "end": 7}),
             "max_per_hour": int(auto_update.get("max_per_hour", 4) or 4),
@@ -210,17 +284,20 @@ class PowerOnWizard:
         return kb
 
     def _home_keyboard(self):
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
         kb.add(
-            types.KeyboardButton("⚡ Перевірити графік"),
-            types.KeyboardButton("📌 Мої адреси"),
+            types.KeyboardButton("⚡ Графік"),
+            types.KeyboardButton("📌 Адреси"),
+            types.KeyboardButton("🕘 Історія"),
         )
         kb.add(
-            types.KeyboardButton("🕘 Недавні"),
-            types.KeyboardButton("🎛 Налаштування"),
-        )
-        kb.add(
+            types.KeyboardButton("🎛 Налашт."),
             types.KeyboardButton("📡 Статус"),
+            types.KeyboardButton("❓ FAQ"),
+        )
+        kb.add(
+            types.KeyboardButton("⭐ Оцінка"),
+            types.KeyboardButton("📝 Відгук"),
             types.KeyboardButton("🏠 Додому"),
         )
         return kb
@@ -237,11 +314,11 @@ class PowerOnWizard:
 
         kb = types.InlineKeyboardMarkup(row_width=1)
         has_any = False
-        for idx, item in enumerate(pinned[:3]):
+        for idx, item in enumerate(pinned[:MAX_PINNED_ITEMS]):
             kb.add(types.InlineKeyboardButton(f"📌 {self._address_caption(item)}", callback_data=f"poweron:pin_open:{idx}"))
             has_any = True
         if history:
-            kb.add(types.InlineKeyboardButton("🕘 Історія (останні 3)", callback_data="poweron:history"))
+            kb.add(types.InlineKeyboardButton("🕘 Історія (останні 6)", callback_data="poweron:history"))
             has_any = True
 
         kb.add(types.InlineKeyboardButton("⚙️ Автооновлення", callback_data="poweron:auto_settings"))
@@ -254,7 +331,7 @@ class PowerOnWizard:
             return None
 
         kb = types.InlineKeyboardMarkup(row_width=1)
-        for idx, item in enumerate(pinned[:3]):
+        for idx, item in enumerate(pinned[:MAX_PINNED_ITEMS]):
             kb.add(types.InlineKeyboardButton(f"📌 {self._address_caption(item)}", callback_data=f"poweron:pin_open:{idx}"))
         nav = self._nav_keyboard()
         for row in nav.keyboard:
@@ -269,7 +346,7 @@ class PowerOnWizard:
 
         pinned_keys = {item["cache_key"] for item in self.pinned.get(chat_id, [])}
         kb = types.InlineKeyboardMarkup(row_width=1)
-        for idx, item in enumerate(history[:3]):
+        for idx, item in enumerate(history[:MAX_HISTORY_ITEMS]):
             caption = self._address_caption(item)
             pin_title = "❌ Відкріпити" if item["cache_key"] in pinned_keys else "📌 Закріпити"
             kb.add(types.InlineKeyboardButton(f"🏠 {caption}", callback_data=f"poweron:hist_open:{idx}"))
@@ -291,7 +368,7 @@ class PowerOnWizard:
 
     def _settings_keyboard(self, chat_id: int) -> types.InlineKeyboardMarkup:
         self._ensure_user_loaded(chat_id)
-        auto = self.auto_update.get(chat_id, {"enabled": False, "interval": 60, "silent": True})
+        auto = self.auto_update.get(chat_id, self._default_auto_update_settings())
         status = "✅ ON" if auto.get("enabled") else "⛔️ OFF"
         interval = int(auto.get("interval", 60) or 60)
         silent = "🤫 Тихий" if auto.get("silent", True) else "🔔 Повідомляти завжди"
@@ -308,7 +385,7 @@ class PowerOnWizard:
 
     def _auto_update_settings_keyboard(self, chat_id: int) -> types.InlineKeyboardMarkup:
         self._ensure_user_loaded(chat_id)
-        settings = self.auto_update.get(chat_id, {"enabled": False, "interval": 60, "silent": True})
+        settings = self.auto_update.get(chat_id, self._default_auto_update_settings())
         current_interval = int(settings.get("interval", 60) or 60)
 
         kb = types.InlineKeyboardMarkup(row_width=2)
@@ -327,10 +404,56 @@ class PowerOnWizard:
             types.InlineKeyboardButton("120с", callback_data="poweron:auto_on:120"),
             types.InlineKeyboardButton("✍️ Свій інтервал", callback_data="poweron:auto_custom"),
         )
+        kb.add(types.InlineKeyboardButton("📍 Адреси для автооновлення", callback_data="poweron:auto_pick"))
         nav = self._nav_keyboard()
         for row in nav.keyboard:
             kb.keyboard.append(row)
         return kb
+
+    def _auto_update_candidates(self, chat_id: int) -> list:
+        self._ensure_user_loaded(chat_id)
+        unique = []
+        seen = set()
+        for item in (self.pinned.get(chat_id, []) + self.history.get(chat_id, [])):
+            key = item.get("cache_key")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return unique[:MAX_HISTORY_ITEMS]
+
+    def _auto_update_address_keyboard(self, chat_id: int) -> types.InlineKeyboardMarkup:
+        settings = self.auto_update.setdefault(chat_id, self._default_auto_update_settings())
+        selected = set(settings.get("selected_keys") or [])
+        candidates = self._auto_update_candidates(chat_id)
+
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        if not candidates:
+            kb.add(types.InlineKeyboardButton("Немає адрес (спершу відкрийте графік)", callback_data="poweron:auto_settings"))
+        else:
+            for item in candidates:
+                key = item.get("cache_key", "")
+                checked = "✅" if key in selected else "▫️"
+                kb.add(types.InlineKeyboardButton(f"{checked} {self._address_caption(item)}", callback_data=f"poweron:auto_addr:{key}"))
+
+        kb.add(types.InlineKeyboardButton("⬅️ До автооновлення", callback_data="poweron:auto_settings"))
+        nav = self._nav_keyboard()
+        for row in nav.keyboard:
+            kb.keyboard.append(row)
+        return kb
+
+    def _faq_text(self) -> str:
+        return (
+            "❓ FAQ PowerON\n"
+            "────────────\n"
+            "• Як почати? Натисніть «⚡ Перевірити графік», оберіть населений пункт, вулицю, будинок.\n"
+            "• Що показує бот? Скріншот графіка + значення ГПВ з API.\n"
+            "• Історія/закріплені: зберігається до 6 адрес в історії і до 6 закріплених.\n"
+            "• Автооновлення: у «🎛 Налаштування» відкрийте автооновлення, увімкніть інтервал і виберіть адреси «📍 Адреси для автооновлення».\n"
+            "• Тихий режим: надсилання лише при зміні графіка.\n"
+            "• Оцінка та відгук: кнопки «⭐ Оцінити бота» і «📝 Зворотній зв'язок» на головному екрані.\n"
+            "• Якщо щось не працює: спробуйте повторити запит або відкрийте https://poweron.toe.com.ua/ вручну."
+        )
 
     # ---------------------- data operations ----------------------
     def _upsert_history(self, chat_id: int, item: dict):
@@ -382,7 +505,8 @@ class PowerOnWizard:
             f"• Інтервал: {interval}с\n"
             f"• Режим: {mode}\n"
             f"• Остання адреса: {last_address}\n"
-            f"• Адрес в історії: {len(history)}"
+            f"• Адрес в історії: {len(history)}\n"
+            f"• Закріплених адрес: {len(self.pinned.get(chat_id, []))}"
         )
 
     def send_home(self, chat_id: int):
@@ -421,11 +545,11 @@ class PowerOnWizard:
         session = self.state.get(chat_id)
         text = (message.text or "").strip()
 
-        if text in {"💡 Графік світла (за адресою)", "💡 Графік світла", "⚡ Перевірити графік"}:
+        if text in {"💡 Графік світла (за адресою)", "💡 Графік світла", "⚡ Перевірити графік", "⚡ Графік"}:
             self.start(chat_id)
             return True
 
-        if text in {"📌 Закріплені", "📌 Мої адреси"}:
+        if text in {"📌 Закріплені", "📌 Мої адреси", "📌 Адреси"}:
             pinned_kb = self._pinned_keyboard(chat_id)
             if not pinned_kb:
                 self.bot.send_message(chat_id, "Немає закріплених адрес. Закріпіть адресу з історії.")
@@ -438,21 +562,65 @@ class PowerOnWizard:
             if not history_kb:
                 self.bot.send_message(chat_id, "Історія порожня. Спочатку перегляньте графік хоча б для однієї адреси.")
             else:
-                self.bot.send_message(chat_id, "🕘 Останні 3 адреси. Можна відкрити або закріпити:", reply_markup=history_kb)
+                self.bot.send_message(chat_id, "🕘 Останні 6 адрес. Можна відкрити або закріпити:", reply_markup=history_kb)
             return True
 
-        if text in {"⚙️ Налаштування", "🎛 Налаштування"}:
+        if text in {"⚙️ Налаштування", "🎛 Налаштування", "🎛 Налашт."}:
             self.state.pop(chat_id, None)
             self.send_settings(chat_id)
             return True
 
-        if text in {"ℹ️ Статус", "📡 Статус"}:
+        if text in {"ℹ️ Статус", "📡 Статус"} or text.lower() == "/status":
             self.bot.send_message(chat_id, self._status_text(chat_id), reply_markup=self._home_keyboard())
+            return True
+
+        if text.lower() in {"/faq", "faq"} or text in {"❓ FAQ"}:
+            self.bot.send_message(chat_id, self._faq_text(), reply_markup=self._home_keyboard())
+            return True
+
+        if text in {"⭐ Оцінити бота", "⭐ Оцінка"}:
+            self.state[chat_id] = {"step": "rating_input"}
+            self.bot.send_message(chat_id, "⭐ Оцініть бота від 1 до 5 (надішліть лише число).")
+            return True
+
+        if text in {"📝 Зворотній зв'язок", "📝 Відгук"}:
+            self.state[chat_id] = {"step": "feedback_input"}
+            self.bot.send_message(chat_id, "📝 Напишіть ваш відгук одним повідомленням. Ми врахуємо його в наступних оновленнях.")
             return True
 
         if text in {"🏠 Головна", "🏠 Додому"}:
             self.state.pop(chat_id, None)
             self.send_home(chat_id)
+            return True
+
+        if session and session.get("step") == "rating_input":
+            try:
+                rating = int(text)
+            except ValueError:
+                self.bot.send_message(chat_id, "Введіть число від 1 до 5.")
+                return True
+            if rating < 1 or rating > 5:
+                self.bot.send_message(chat_id, "Оцінка має бути в межах 1..5.")
+                return True
+            user = getattr(message, "from_user", None)
+            self.set_user_rating(chat_id, rating)
+            self.state.pop(chat_id, None)
+            self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard())
+            return True
+
+        if session and session.get("step") == "feedback_input":
+            if len(text) < 3:
+                self.bot.send_message(chat_id, "Будь ласка, додайте трохи більше деталей (мінімум 3 символи).")
+                return True
+            user = getattr(message, "from_user", None)
+            self.add_feedback_entry(
+                chat_id,
+                text,
+                username=getattr(user, "username", "") or "",
+                first_name=getattr(user, "first_name", "") or "",
+            )
+            self.state.pop(chat_id, None)
+            self.bot.send_message(chat_id, "✅ Дякуємо за відгук!", reply_markup=self._home_keyboard())
             return True
 
         if session and session.get("step") == "auto_interval_input":
@@ -465,7 +633,7 @@ class PowerOnWizard:
                 self.bot.send_message(chat_id, "Мінімальний інтервал — 10 секунд.")
                 return True
 
-            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "last_signatures": {}, "next_run_ts": 0, "quiet_hours": {"enabled": True, "start": 23, "end": 7}, "max_per_hour": 4, "notify_timestamps": [], "failures": 0, "text_mode_until": 0})
+            settings = self.auto_update.setdefault(chat_id, self._default_auto_update_settings())
             settings["enabled"] = True
             settings["interval"] = interval
             settings["next_run_ts"] = time.time() + interval
@@ -559,7 +727,7 @@ class PowerOnWizard:
             if not history_kb:
                 self.bot.send_message(chat_id, "Історія порожня. Спочатку перегляньте графік хоча б для однієї адреси.")
                 return True
-            self.bot.send_message(chat_id, "🕘 Останні 3 адреси. Можна відкрити або закріпити:", reply_markup=history_kb)
+            self.bot.send_message(chat_id, "🕘 Останні 6 адрес. Можна відкрити або закріпити:", reply_markup=history_kb)
             return True
 
         if data == "poweron:auto_settings":
@@ -570,7 +738,7 @@ class PowerOnWizard:
             return True
         if data == "poweron:auto_toggle_silent":
             self._ensure_user_loaded(chat_id)
-            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "last_signatures": {}, "next_run_ts": 0, "quiet_hours": {"enabled": True, "start": 23, "end": 7}, "max_per_hour": 4, "notify_timestamps": [], "failures": 0, "text_mode_until": 0})
+            settings = self.auto_update.setdefault(chat_id, self._default_auto_update_settings())
             settings["silent"] = not settings.get("silent", True)
             self._save_user_data(chat_id)
             mode = "🤫 Тихий" if settings["silent"] else "🔔 Завжди"
@@ -580,9 +748,12 @@ class PowerOnWizard:
             self.state[chat_id] = {"step": "auto_interval_input"}
             self.bot.send_message(chat_id, "✍️ Введіть інтервал у секундах (мінімум 10):", reply_markup=self._nav_keyboard())
             return True
+        if data == "poweron:auto_pick":
+            self.bot.send_message(chat_id, "📍 Оберіть адреси для автооновлення (можна кілька):", reply_markup=self._auto_update_address_keyboard(chat_id))
+            return True
         if data == "poweron:auto_off":
             self._ensure_user_loaded(chat_id)
-            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "last_signatures": {}, "next_run_ts": 0, "quiet_hours": {"enabled": True, "start": 23, "end": 7}, "max_per_hour": 4, "notify_timestamps": [], "failures": 0, "text_mode_until": 0})
+            settings = self.auto_update.setdefault(chat_id, self._default_auto_update_settings())
             settings["enabled"] = False
             settings["next_run_ts"] = 0
             self._save_user_data(chat_id)
@@ -590,12 +761,25 @@ class PowerOnWizard:
             return True
 
         try:
+            if data.startswith("poweron:auto_addr:"):
+                cache_key = data.replace("poweron:auto_addr:", "", 1)
+                settings = self.auto_update.setdefault(chat_id, self._default_auto_update_settings())
+                selected = [key for key in (settings.get("selected_keys") or []) if isinstance(key, str)]
+                if cache_key in selected:
+                    selected = [key for key in selected if key != cache_key]
+                else:
+                    selected.insert(0, cache_key)
+                settings["selected_keys"] = selected[:MAX_HISTORY_ITEMS]
+                self._save_user_data(chat_id)
+                self.bot.send_message(chat_id, "✅ Список адрес автооновлення оновлено.", reply_markup=self._auto_update_address_keyboard(chat_id))
+                return True
+
             if data.startswith("poweron:auto_on:"):
                 interval = int(data.rsplit(":", 1)[1])
                 if interval < 10:
                     interval = 10
                 self._ensure_user_loaded(chat_id)
-                settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "last_signatures": {}, "next_run_ts": 0, "quiet_hours": {"enabled": True, "start": 23, "end": 7}, "max_per_hour": 4, "notify_timestamps": [], "failures": 0, "text_mode_until": 0})
+                settings = self.auto_update.setdefault(chat_id, self._default_auto_update_settings())
                 settings["enabled"] = True
                 settings["interval"] = interval
                 settings["next_run_ts"] = time.time() + interval
@@ -687,6 +871,31 @@ class PowerOnWizard:
     def _entry_signature(entry: dict) -> str:
         return entry.get("cache_key", "")
 
+    @staticmethod
+    def _entry_ids(entry: dict) -> Optional[Tuple[int, int, int]]:
+        cache_key = (entry or {}).get("cache_key", "")
+        if not cache_key:
+            return None
+        try:
+            settlement_id, street_id, house_id = cache_key.split(":")
+            return int(settlement_id), int(street_id), int(house_id)
+        except (TypeError, ValueError):
+            return None
+
+    def _refresh_entry_schedule(self, entry: dict) -> dict:
+        entry = dict(entry or {})
+        ids = self._entry_ids(entry)
+        if not ids:
+            return entry
+
+        try:
+            schedule = asyncio.run(self.client.fetch_house_schedule(*ids))
+            if schedule:
+                entry["schedule"] = schedule
+        except Exception as exc:
+            self.logger.warning("poweron.schedule_refresh_failed cache_key=%s error=%s", entry.get("cache_key", ""), exc)
+        return entry
+
     # ---------------------- auto update worker ----------------------
     def _schedule_auto_update(self, chat_id: int):
         settings = self.auto_update.get(chat_id) or {}
@@ -738,7 +947,16 @@ class PowerOnWizard:
             self._schedule_auto_update(chat_id)
 
             history = self.history.get(chat_id, [])
-            candidates = history[:MAX_HISTORY_ITEMS] if self.feature_flags.get("multi_address_auto", True) else history[:1]
+            selected_keys = set(settings.get("selected_keys") or [])
+            all_candidates = self._auto_update_candidates(chat_id)
+            if selected_keys:
+                candidates = [item for item in all_candidates if item.get("cache_key") in selected_keys]
+            else:
+                candidates = history[:1]
+            if self.feature_flags.get("multi_address_auto", True):
+                candidates = candidates[:MAX_HISTORY_ITEMS]
+            else:
+                candidates = candidates[:1]
             if not candidates:
                 self._save_user_data(chat_id)
                 continue
@@ -768,7 +986,7 @@ class PowerOnWizard:
                 always_notify = not settings.get("silent", True)
 
                 if (changed or always_notify) and self._can_notify_now(settings):
-                    self._deliver_schedule(chat_id, image_path, entry, item.get("schedule", {}), auto=True)
+                    self._deliver_schedule(chat_id, image_path, entry, entry.get("schedule", {}), auto=True)
                     self.metrics["auto_update_notifications"] += 1
                     settings["notify_timestamps"] = (settings.get("notify_timestamps") or []) + [time.time()]
                     signatures[entry_key] = signature
@@ -803,12 +1021,13 @@ class PowerOnWizard:
             return None
 
         if address_item:
-            settlement_render = address_item.get("settlement_render") or address_item.get("settlement_name")
-            settlement_display = address_item.get("settlement_display") or address_item.get("settlement_name")
-            street_name = address_item["street_name"]
-            house_name = address_item["house_name"]
-            cache_key = address_item["cache_key"]
-            schedule = address_item.get("schedule") or {}
+            normalized_item = self._refresh_entry_schedule(address_item)
+            settlement_render = normalized_item.get("settlement_render") or normalized_item.get("settlement_name")
+            settlement_display = normalized_item.get("settlement_display") or normalized_item.get("settlement_name")
+            street_name = normalized_item["street_name"]
+            house_name = normalized_item["house_name"]
+            cache_key = normalized_item["cache_key"]
+            schedule = normalized_item.get("schedule") or {}
         else:
             settlement = session.get("settlement")
             street = session.get("street")
@@ -844,6 +1063,7 @@ class PowerOnWizard:
                 entry["street_name"],
                 entry["house_name"],
                 entry["cache_key"],
+                force_refresh=bool(address_item),
             )
         )
         self.metrics["last_render_ms"] = int((time.time() - started) * 1000)
@@ -870,10 +1090,6 @@ class PowerOnWizard:
             f"Адреса: {address_caption}\n\n"
             "Черги з API:\n"
             f"• ГПВ: {schedule.get('gpv', '—')}\n"
-            f"• ГАВ: {schedule.get('gav', '—')}\n"
-            f"• АЧР: {schedule.get('achr', '—')}\n"
-            f"• ГВСП: {schedule.get('gvsp', '—')}\n"
-            f"• СГАВ: {schedule.get('sgav', '—')}\n"
         )
         if reason:
             details += f"\nТехнічна причина: {reason}\n"
@@ -895,11 +1111,7 @@ class PowerOnWizard:
         self.bot.send_message(
             chat_id,
             "Черги з API:\n"
-            f"• ГПВ: {schedule.get('gpv', '—')}\n"
-            f"• ГАВ: {schedule.get('gav', '—')}\n"
-            f"• АЧР: {schedule.get('achr', '—')}\n"
-            f"• ГВСП: {schedule.get('gvsp', '—')}\n"
-            f"• СГАВ: {schedule.get('sgav', '—')}",
+            f"• ГПВ: {schedule.get('gpv', '—')}",
             reply_markup=self._quick_access_keyboard(chat_id) or self._nav_keyboard(),
         )
 
@@ -921,7 +1133,7 @@ class PowerOnWizard:
             self.metrics["schedule_success"] += 1
             self._upsert_history(chat_id, entry)
 
-            settings = self.auto_update.setdefault(chat_id, {"enabled": False, "interval": 60, "silent": True, "last_signature": "", "last_signatures": {}, "next_run_ts": 0, "quiet_hours": {"enabled": True, "start": 23, "end": 7}, "max_per_hour": 4, "notify_timestamps": [], "failures": 0, "text_mode_until": 0})
+            settings = self.auto_update.setdefault(chat_id, self._default_auto_update_settings())
             settings["last_signature"] = signature
             self._save_user_data(chat_id)
         except PowerOnClientError as exc:
