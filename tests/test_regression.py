@@ -215,7 +215,8 @@ class WizardFeedbackTests(unittest.TestCase):
         wizard = PowerOnWizard(bot)
 
         self.assertTrue(wizard.handle_message(self._message(10, "⭐ Оцінити бота")))
-        self.assertTrue(wizard.handle_message(self._message(10, "5")))
+        call = type("Call", (), {"data": "poweron:rate:5", "message": type("M", (), {"chat": type("C", (), {"id": 10})()})()})()
+        self.assertTrue(wizard.handle_callback(call))
         summary = wizard.get_rating_summary()
         self.assertGreaterEqual(summary["count"], 1)
 

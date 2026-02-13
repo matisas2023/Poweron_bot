@@ -443,6 +443,18 @@ class PowerOnWizard:
             kb.keyboard.append(row)
         return kb
 
+    @staticmethod
+    def _rating_keyboard() -> types.InlineKeyboardMarkup:
+        kb = types.InlineKeyboardMarkup(row_width=5)
+        kb.add(
+            types.InlineKeyboardButton("1⭐", callback_data="poweron:rate:1"),
+            types.InlineKeyboardButton("2⭐", callback_data="poweron:rate:2"),
+            types.InlineKeyboardButton("3⭐", callback_data="poweron:rate:3"),
+            types.InlineKeyboardButton("4⭐", callback_data="poweron:rate:4"),
+            types.InlineKeyboardButton("5⭐", callback_data="poweron:rate:5"),
+        )
+        return kb
+
     def _faq_text(self) -> str:
         return (
             "❓ FAQ PowerON\n"
@@ -452,7 +464,7 @@ class PowerOnWizard:
             "• Історія/закріплені: зберігається до 6 адрес в історії і до 6 закріплених.\n"
             "• Автооновлення: у «🎛 Налаштування» відкрийте автооновлення, увімкніть інтервал і виберіть адреси «📍 Адреси для автооновлення».\n"
             "• Тихий режим: надсилання лише при зміні графіка.\n"
-            "• Оцінка та відгук: кнопки «⭐ Оцінити бота» і «📝 Зворотній зв'язок» на головному екрані.\n"
+            "• Оцінка та відгук: кнопки «⭐ Оцінка» і «📝 Відгук» на головному екрані.\n"
             "• Якщо щось не працює: спробуйте повторити запит або відкрийте https://poweron.toe.com.ua/ вручну."
         )
 
@@ -580,8 +592,8 @@ class PowerOnWizard:
             return True
 
         if text in {"⭐ Оцінити бота", "⭐ Оцінка"}:
-            self.state[chat_id] = {"step": "rating_input"}
-            self.bot.send_message(chat_id, "⭐ Оцініть бота від 1 до 5 (надішліть лише число).")
+            self.state.pop(chat_id, None)
+            self.bot.send_message(chat_id, "⭐ Оберіть оцінку бота:", reply_markup=self._rating_keyboard())
             return True
 
         if text in {"📝 Зворотній зв'язок", "📝 Відгук"}:
@@ -759,6 +771,17 @@ class PowerOnWizard:
             settings["next_run_ts"] = 0
             self._save_user_data(chat_id)
             self.bot.send_message(chat_id, "⛔️ Автооновлення вимкнено.", reply_markup=self._auto_update_settings_keyboard(chat_id))
+            return True
+
+        if data.startswith("poweron:rate:"):
+            try:
+                rating = int(data.rsplit(":", 1)[1])
+            except ValueError:
+                return True
+            if rating < 1 or rating > 5:
+                return True
+            self.set_user_rating(chat_id, rating)
+            self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard())
             return True
 
         try:
