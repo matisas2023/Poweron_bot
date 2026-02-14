@@ -62,6 +62,7 @@ class PowerOnWizard:
             "auto_update_runs": 0,
             "auto_update_notifications": 0,
             "last_render_ms": 0,
+            "schedule_latencies_ms": [],
         }
         self._auto_update_heap = []
 
@@ -305,8 +306,16 @@ class PowerOnWizard:
             types.KeyboardButton("📝 Відгук"),
             types.KeyboardButton("🏠 Додому"),
         )
-        kb.add(types.KeyboardButton("🏠 Додому"))
         return kb
+
+    def _record_metric_latency(self, key: str, duration_ms: int, max_items: int = 200):
+        values = self.metrics.get(key)
+        if not isinstance(values, list):
+            values = []
+            self.metrics[key] = values
+        values.append(max(0, int(duration_ms)))
+        if len(values) > max_items:
+            del values[:-max_items]
 
     @staticmethod
     def _address_caption(item: dict) -> str:
@@ -538,7 +547,11 @@ class PowerOnWizard:
 
 Це сучасний бот для перевірки графіків відключень за вашою адресою.
 
-Натисніть «⚡ Перевірити графік», щоб почати пошук.""",
+1) Натисніть «⚡ Перевірити графік».
+2) Оберіть населений пункт, вулицю, будинок.
+3) Отримайте скріншот та ГПВ.
+
+Порада: закріпіть адресу у «📌 Адреси» для швидкого доступу.""",
                 reply_markup=self._home_keyboard(),
             )
             return
@@ -1155,6 +1168,7 @@ class PowerOnWizard:
         )
 
     def _send_schedule(self, chat_id: int, address_item: Optional[dict] = None, show_wait: bool = True):
+        started = time.time()
         self.metrics["schedule_requests"] += 1
         entry = self._build_entry_from_context(chat_id, address_item)
         try:
@@ -1183,6 +1197,8 @@ class PowerOnWizard:
             self.metrics["schedule_failures"] += 1
             self.logger.exception("poweron.render_failed chat_id=%s error=%s", chat_id, exc)
             self._send_text_fallback(chat_id, entry, (entry or {}).get("schedule", {}), reason="непередбачена помилка")
+        finally:
+            self._record_metric_latency("schedule_latencies_ms", int((time.time() - started) * 1000))
 
     def health_snapshot(self) -> dict:
         return {
