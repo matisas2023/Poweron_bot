@@ -109,6 +109,14 @@ class LoggingTests(unittest.TestCase):
 
 
 class WizardFallbackTests(unittest.TestCase):
+    def test_home_keyboard_has_single_home_button(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot)
+
+        kb = wizard._home_keyboard()
+        home_count = sum(1 for row in kb.keyboard for btn in row if (btn.get("text") if isinstance(btn, dict) else "") == "🏠 Додому")
+        self.assertEqual(home_count, 1)
+
     def test_send_schedule_falls_back_to_text(self):
         bot = DummyBot()
         wizard = PowerOnWizard(bot)
@@ -126,6 +134,7 @@ class WizardFallbackTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(bot.messages), 1)
         self.assertEqual(wizard.metrics["text_fallbacks"], 1)
+        self.assertGreaterEqual(len(wizard.metrics.get("schedule_latencies_ms", [])), 1)
 
     def test_build_entry_refreshes_schedule_from_api(self):
         bot = DummyBot()
@@ -167,10 +176,12 @@ class WizardFallbackTests(unittest.TestCase):
     def test_auto_update_can_select_specific_addresses(self):
         bot = DummyBot()
         wizard = PowerOnWizard(bot)
+        wizard._ensure_user_loaded(1)
         wizard.history[1] = [
             {"cache_key": "1:2:3", "settlement_display": "A", "street_name": "S", "house_name": "1"},
             {"cache_key": "1:2:4", "settlement_display": "B", "street_name": "S", "house_name": "2"},
         ]
+        wizard.auto_update[1] = wizard._default_auto_update_settings()
         call = type("Call", (), {"data": "poweron:auto_addr:1:2:4", "message": type("M", (), {"chat": type("C", (), {"id": 1})()})()})()
 
         handled = wizard.handle_callback(call)
