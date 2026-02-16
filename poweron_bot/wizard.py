@@ -57,6 +57,7 @@ class PowerOnWizard:
             "quiet_hours_enabled": True,
             "text_mode_cooldown": True,
             "compare_enabled": True,
+            "degraded_mode": False,
         }
 
         self.metrics = {
@@ -1091,6 +1092,8 @@ class PowerOnWizard:
                 continue
 
             interval = max(10, int(settings.get("interval", 60) or 60))
+            if self.feature_flags.get("degraded_mode"):
+                interval = max(interval, 120)
             settings["next_run_ts"] = now + interval
             self._schedule_auto_update(chat_id)
 

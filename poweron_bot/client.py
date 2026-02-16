@@ -19,6 +19,9 @@ CACHE_CLEANUP_INTERVAL_SECONDS = 300
 CACHE_MAX_FILES = 500
 CACHE_MAX_FILE_AGE_SECONDS = 2 * 24 * 60 * 60
 BROWSER_ENV_PATH = "POWERON_BROWSER_PATH"
+CACHE_MAX_FILES_ENV = "POWERON_CACHE_MAX_FILES"
+CACHE_MAX_FILE_AGE_ENV = "POWERON_CACHE_MAX_FILE_AGE_SECONDS"
+CACHE_LOW_DISK_FREE_MB_ENV = "POWERON_CACHE_LOW_DISK_FREE_MB"
 
 SITE_PROFILE = {
     "search_button_names": ["Знайти", "Пошук", "Показати", "Отримати графік"],
@@ -59,6 +62,9 @@ class PowerOnClient:
         self._locks: Dict[str, Tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
         self._last_cache_cleanup_ts = 0.0
         self._cleanup_worker_started = False
+        self.cache_max_files = self._env_int(CACHE_MAX_FILES_ENV, CACHE_MAX_FILES, min_value=50)
+        self.cache_max_file_age_seconds = self._env_int(CACHE_MAX_FILE_AGE_ENV, CACHE_MAX_FILE_AGE_SECONDS, min_value=600)
+        self.cache_low_disk_free_mb = self._env_int(CACHE_LOW_DISK_FREE_MB_ENV, 1024, min_value=128)
         self.metrics = {
             "api_requests": 0,
             "api_failures": 0,
@@ -73,6 +79,11 @@ class PowerOnClient:
             "render_latencies_ms": [],
             "cache_cleanup_runs": 0,
             "cache_files_deleted": 0,
+            "low_disk_guard_triggers": 0,
+            "api_request_timestamps": [],
+            "api_failure_timestamps": [],
+            "render_attempt_timestamps": [],
+            "render_failure_timestamps": [],
         }
         if enable_periodic_cleanup:
             self._start_periodic_cache_cleanup_worker()
@@ -95,6 +106,26 @@ class PowerOnClient:
             bucket = []
             self.metrics[key] = bucket
         bucket.append(max(0, int(duration_ms)))
+        if len(bucket) > max_items:
+            del bucket[:-max_items]
+
+    @staticmethod
+    def _env_int(name: str, default: int, min_value: int = 1) -> int:
+        raw = (os.getenv(name, "") or "").strip()
+        if not raw:
+            return int(default)
+        try:
+            value = int(raw)
+        except ValueError:
+            return int(default)
+        return max(min_value, value)
+
+    def _record_timestamp(self, key: str, max_items: int = 500) -> None:
+        bucket = self.metrics.get(key)
+        if not isinstance(bucket, list):
+            bucket = []
+            self.metrics[key] = bucket
+        bucket.append(int(time.time()))
         if len(bucket) > max_items:
             del bucket[:-max_items]
 
@@ -121,6 +152,7 @@ class PowerOnClient:
         for attempt in range(1, API_RETRIES + 1):
             started = time.time()
             self.metrics["api_requests"] += 1
+            self._record_timestamp("api_request_timestamps")
             try:
                 if self._has_module("httpx"):
                     import httpx
@@ -151,6 +183,7 @@ class PowerOnClient:
                 last_error = exc
 
             self.metrics["api_failures"] += 1
+            self._record_timestamp("api_failure_timestamps")
             self._record_latency("api_latencies_ms", int((time.time() - started) * 1000))
             if attempt < API_RETRIES:
                 await asyncio.sleep(0.5 * attempt)
@@ -238,8 +271,24 @@ class PowerOnClient:
                 stat = os.stat(path)
                 files.append((path, stat.st_mtime))
 
+            guard_mode = False
+            try:
+                disk_usage = shutil.disk_usage(self.cache_dir)
+                free_mb = int(disk_usage.free / (1024 * 1024))
+                if free_mb < self.cache_low_disk_free_mb:
+                    guard_mode = True
+                    self.metrics["low_disk_guard_triggers"] += 1
+            except OSError:
+                guard_mode = False
+
+            max_age_seconds = self.cache_max_file_age_seconds
+            max_files = self.cache_max_files
+            if guard_mode:
+                max_age_seconds = min(max_age_seconds, 6 * 60 * 60)
+                max_files = max(50, int(max_files * 0.5))
+
             for path, mtime in files:
-                if now - mtime > CACHE_MAX_FILE_AGE_SECONDS:
+                if now - mtime > max_age_seconds:
                     try:
                         os.remove(path)
                         removed_files += 1
@@ -251,7 +300,7 @@ class PowerOnClient:
                 key=lambda item: item[1],
                 reverse=True,
             )
-            for path, _ in files[CACHE_MAX_FILES:]:
+            for path, _ in files[max_files:]:
                 try:
                     os.remove(path)
                     removed_files += 1
@@ -315,6 +364,7 @@ class PowerOnClient:
             last_error = None
             for attempt in range(1, CAPTURE_RETRIES + 1):
                 self.metrics["render_attempts"] += 1
+                self._record_timestamp("render_attempt_timestamps")
                 started = time.time()
                 try:
                     await self._capture_from_site(settlement_name, street_name, house_name, image_path)
@@ -327,6 +377,7 @@ class PowerOnClient:
                     last_error = exc
                     self.metrics["last_render_error"] = str(exc)
                     self.metrics["render_failures"] += 1
+                    self._record_timestamp("render_failure_timestamps")
                     self._record_latency("render_latencies_ms", int((time.time() - started) * 1000))
                     if attempt < CAPTURE_RETRIES:
                         await asyncio.sleep(0.75 * attempt)
