@@ -133,7 +133,7 @@ class WizardFallbackTests(unittest.TestCase):
         home_count = sum(1 for row in kb.keyboard for btn in row if (btn.get("text") if isinstance(btn, dict) else "") == "🏠 Додому")
         self.assertEqual(home_count, 1)
         map_count = sum(1 for row in kb.keyboard for btn in row if (btn.get("text") if isinstance(btn, dict) else "") == "🗺 Мапа світла (Тернопіль)")
-        self.assertEqual(map_count, 1)
+        self.assertEqual(map_count, 0)
 
     def test_home_keyboard_shows_admin_panel_only_for_admin(self):
         bot = DummyBot()
@@ -147,6 +147,11 @@ class WizardFallbackTests(unittest.TestCase):
 
         self.assertTrue(admin_has)
         self.assertFalse(regular_has)
+
+        admin_map = any((btn.get("text") if isinstance(btn, dict) else "") == "🗺 Мапа світла (Тернопіль)" for row in admin_kb.keyboard for btn in row)
+        regular_map = any((btn.get("text") if isinstance(btn, dict) else "") == "🗺 Мапа світла (Тернопіль)" for row in regular_kb.keyboard for btn in row)
+        self.assertTrue(admin_map)
+        self.assertFalse(regular_map)
 
     def test_send_schedule_falls_back_to_text(self):
         bot = DummyBot()
@@ -169,7 +174,7 @@ class WizardFallbackTests(unittest.TestCase):
 
     def test_map_command_returns_ternopil_link(self):
         bot = DummyBot()
-        wizard = PowerOnWizard(bot)
+        wizard = PowerOnWizard(bot, admin_user_id=77)
         msg = type(
             "Msg",
             (),
@@ -183,6 +188,23 @@ class WizardFallbackTests(unittest.TestCase):
         handled = wizard.handle_message(msg)
         self.assertTrue(handled)
         self.assertTrue(any("svitlo.ternopil.webcam" in text for _, text in bot.messages))
+
+    def test_map_command_for_non_admin_returns_testing_notice(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot, admin_user_id=77)
+        msg = type(
+            "Msg",
+            (),
+            {
+                "text": "/map_ternopil",
+                "chat": type("Chat", (), {"id": 78})(),
+                "from_user": type("User", (), {"id": 78, "username": "u", "first_name": "N"})(),
+            },
+        )()
+
+        handled = wizard.handle_message(msg)
+        self.assertTrue(handled)
+        self.assertTrue(any("лише адміну" in text.lower() for _, text in bot.messages))
 
     def test_build_entry_refreshes_schedule_from_api(self):
         bot = DummyBot()

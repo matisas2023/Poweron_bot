@@ -335,7 +335,8 @@ class PowerOnWizard:
             types.KeyboardButton("📡 Статус"),
             types.KeyboardButton("❓ FAQ"),
         )
-        kb.add(types.KeyboardButton("🗺 Мапа світла (Тернопіль)"))
+        if chat_id is not None and self.admin_user_id is not None and int(chat_id) == int(self.admin_user_id):
+            kb.add(types.KeyboardButton("🗺 Мапа світла (Тернопіль)"))
         kb.add(
             types.KeyboardButton("⭐ Оцінка"),
             types.KeyboardButton("📝 Відгук"),
@@ -528,8 +529,8 @@ class PowerOnWizard:
         )
         return kb
 
-    def _faq_text(self) -> str:
-        return (
+    def _faq_text(self, chat_id: Optional[int] = None) -> str:
+        lines = [
             "❓ FAQ PowerON\n"
             "────────────\n"
             "• Як почати? Натисніть «⚡ Перевірити графік», оберіть населений пункт, вулицю, будинок.\n"
@@ -540,6 +541,22 @@ class PowerOnWizard:
             "• Оцінка та відгук: кнопки «⭐ Оцінка» і «📝 Відгук» на головному екрані.\n"
             "• Де дивитись карту світла в Тернополі? Натисніть «🗺 Мапа світла (Тернопіль)».\n"
             "• Якщо щось не працює: спробуйте повторити запит або відкрийте https://poweron.toe.com.ua/ вручну."
+        ]
+        if chat_id is not None and self.admin_user_id is not None and int(chat_id) == int(self.admin_user_id):
+            lines.insert(-1, "• Тест мапи світла Тернополя: кнопка «🗺 Мапа світла (Тернопіль)».\n")
+        return "".join(lines)
+
+    @staticmethod
+    def _ternopil_map_text() -> str:
+        return (
+            "🗺 Мапа наявності світла (Тернопіль):\n"
+            "https://svitlo.ternopil.webcam/\n\n"
+            "Що можна інтегрувати в бот із цього сервісу:\n"
+            "• Швидка кнопка відкриття карти (вже додано).\n"
+            "• Команда /map_ternopil для миттєвого доступу.\n"
+            "• Автосповіщення при зміні статусу по обраних районах (якщо сервіс надає API/стабільний feed).\n"
+            "• Теплова мапа/агрегація по районах у щоденному зведенні для адміна.\n"
+            "• Зв'язка з вашими автооновленнями графіків: повідомляти, коли за мапою є світло, а графік ще не оновився."
         )
 
     @staticmethod
@@ -718,10 +735,13 @@ class PowerOnWizard:
             return True
 
         if text.lower() in {"/faq", "faq"} or text in {"❓ FAQ"}:
-            self.bot.send_message(chat_id, self._faq_text(), reply_markup=self._home_keyboard(chat_id))
+            self.bot.send_message(chat_id, self._faq_text(chat_id), reply_markup=self._home_keyboard(chat_id))
             return True
 
         if text in {"🗺 Мапа світла (Тернопіль)", "🗺 Мапа світла"} or text.lower() in {"/map_ternopil", "/ternopil_map", "/map"}:
+            if self.admin_user_id is None or int(chat_id) != int(self.admin_user_id):
+                self.bot.send_message(chat_id, "ℹ️ Функція мапи Тернополя тимчасово доступна лише адміну для тестування.")
+                return True
             self.bot.send_message(chat_id, self._ternopil_map_text(), reply_markup=self._home_keyboard(chat_id))
             return True
 
