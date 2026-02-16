@@ -335,6 +335,7 @@ class PowerOnWizard:
             types.KeyboardButton("📡 Статус"),
             types.KeyboardButton("❓ FAQ"),
         )
+        kb.add(types.KeyboardButton("🗺 Мапа світла (Тернопіль)"))
         kb.add(
             types.KeyboardButton("⭐ Оцінка"),
             types.KeyboardButton("📝 Відгук"),
@@ -537,7 +538,21 @@ class PowerOnWizard:
             "• Автооновлення: у «🎛 Налаштування» відкрийте автооновлення, увімкніть інтервал і виберіть адреси «📍 Адреси для автооновлення».\n"
             "• Тихий режим: надсилання лише при зміні графіка.\n"
             "• Оцінка та відгук: кнопки «⭐ Оцінка» і «📝 Відгук» на головному екрані.\n"
+            "• Де дивитись карту світла в Тернополі? Натисніть «🗺 Мапа світла (Тернопіль)».\n"
             "• Якщо щось не працює: спробуйте повторити запит або відкрийте https://poweron.toe.com.ua/ вручну."
+        )
+
+    @staticmethod
+    def _ternopil_map_text() -> str:
+        return (
+            "🗺 Мапа наявності світла (Тернопіль):\n"
+            "https://svitlo.ternopil.webcam/\n\n"
+            "Що можна інтегрувати в бот із цього сервісу:\n"
+            "• Швидка кнопка відкриття карти (вже додано).\n"
+            "• Команда /map_ternopil для миттєвого доступу.\n"
+            "• Автосповіщення при зміні статусу по обраних районах (якщо сервіс надає API/стабільний feed).\n"
+            "• Теплова мапа/агрегація по районах у щоденному зведенні для адміна.\n"
+            "• Зв'язка з вашими автооновленнями графіків: повідомляти, коли за мапою є світло, а графік ще не оновився."
         )
 
     # ---------------------- data operations ----------------------
@@ -704,6 +719,10 @@ class PowerOnWizard:
 
         if text.lower() in {"/faq", "faq"} or text in {"❓ FAQ"}:
             self.bot.send_message(chat_id, self._faq_text(), reply_markup=self._home_keyboard(chat_id))
+            return True
+
+        if text in {"🗺 Мапа світла (Тернопіль)", "🗺 Мапа світла"} or text.lower() in {"/map_ternopil", "/ternopil_map", "/map"}:
+            self.bot.send_message(chat_id, self._ternopil_map_text(), reply_markup=self._home_keyboard(chat_id))
             return True
 
         if text in {"⭐ Оцінити бота", "⭐ Оцінка"}:

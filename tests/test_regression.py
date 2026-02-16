@@ -132,6 +132,8 @@ class WizardFallbackTests(unittest.TestCase):
         kb = wizard._home_keyboard()
         home_count = sum(1 for row in kb.keyboard for btn in row if (btn.get("text") if isinstance(btn, dict) else "") == "🏠 Додому")
         self.assertEqual(home_count, 1)
+        map_count = sum(1 for row in kb.keyboard for btn in row if (btn.get("text") if isinstance(btn, dict) else "") == "🗺 Мапа світла (Тернопіль)")
+        self.assertEqual(map_count, 1)
 
     def test_home_keyboard_shows_admin_panel_only_for_admin(self):
         bot = DummyBot()
@@ -164,6 +166,23 @@ class WizardFallbackTests(unittest.TestCase):
         self.assertGreaterEqual(len(bot.messages), 1)
         self.assertEqual(wizard.metrics["text_fallbacks"], 1)
         self.assertGreaterEqual(len(wizard.metrics.get("schedule_latencies_ms", [])), 1)
+
+    def test_map_command_returns_ternopil_link(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot)
+        msg = type(
+            "Msg",
+            (),
+            {
+                "text": "/map_ternopil",
+                "chat": type("Chat", (), {"id": 77})(),
+                "from_user": type("User", (), {"id": 77, "username": "u", "first_name": "N"})(),
+            },
+        )()
+
+        handled = wizard.handle_message(msg)
+        self.assertTrue(handled)
+        self.assertTrue(any("svitlo.ternopil.webcam" in text for _, text in bot.messages))
 
     def test_build_entry_refreshes_schedule_from_api(self):
         bot = DummyBot()
