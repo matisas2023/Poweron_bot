@@ -18,6 +18,8 @@ MAX_HISTORY_ITEMS = 6
 MAX_PINNED_ITEMS = 6
 AUTO_UPDATE_FAILURE_THRESHOLD = 3
 AUTO_UPDATE_COOLDOWN_SECONDS = 15 * 60
+FEEDBACK_NUDGE_COOLDOWN_SECONDS = 7 * 24 * 60 * 60
+ACTIVE_USER_HISTORY_THRESHOLD = 3
 
 
 class PowerOnWizard:
@@ -31,6 +33,7 @@ class PowerOnWizard:
         self.seen_users = set()
 
         self.auto_update: Dict[int, dict] = {}
+        self.engagement: Dict[int, dict] = {}
         self.rate_limit: Dict[int, float] = {}
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -139,6 +142,12 @@ class PowerOnWizard:
             ratings = self._feedback_payload.get("ratings") or {}
             return str(chat_id) in ratings
 
+    def has_user_feedback(self, chat_id: int) -> bool:
+        with self._feedback_lock:
+            entries = self._feedback_payload.get("entries") or []
+            chat_id_value = int(chat_id)
+            return any(int((item or {}).get("chat_id", 0) or 0) == chat_id_value for item in entries)
+
     def get_feedback_entries(self) -> List[dict]:
         with self._feedback_lock:
             entries = list(self._feedback_payload.get("entries") or [])
@@ -216,6 +225,7 @@ class PowerOnWizard:
             "history": self.history.get(chat_id, [])[:MAX_HISTORY_ITEMS],
             "pinned": self.pinned.get(chat_id, [])[:MAX_PINNED_ITEMS],
             "auto_update": self.auto_update.get(chat_id, self._default_auto_update_settings()),
+            "engagement": self.engagement.get(chat_id, {"last_feedback_nudge_ts": 0}),
         }
         self.store.upsert_chat(chat_id, self._users_payload[payload_key])
         self._save_users_payload()
@@ -246,6 +256,10 @@ class PowerOnWizard:
                 "failures": int(auto_update.get("failures", 0) or 0),
                 "text_mode_until": float(auto_update.get("text_mode_until", 0) or 0),
             }
+            engagement = user_payload.get("engagement") or {}
+            self.engagement[chat_id] = {
+                "last_feedback_nudge_ts": float(engagement.get("last_feedback_nudge_ts", 0) or 0),
+            }
 
             if user_payload.get("seen"):
                 self.seen_users.add(chat_id)
@@ -274,6 +288,10 @@ class PowerOnWizard:
             "notify_timestamps": auto_update.get("notify_timestamps", []),
             "failures": int(auto_update.get("failures", 0) or 0),
             "text_mode_until": float(auto_update.get("text_mode_until", 0) or 0),
+        }
+        engagement = user_payload.get("engagement") or {}
+        self.engagement[chat_id] = {
+            "last_feedback_nudge_ts": float(engagement.get("last_feedback_nudge_ts", 0) or 0),
         }
 
         if user_payload.get("seen"):
@@ -536,6 +554,44 @@ class PowerOnWizard:
             f"• Закріплених адрес: {len(self.pinned.get(chat_id, []))}"
         )
 
+    def _should_send_feedback_nudge(self, chat_id: int, now_ts: Optional[float] = None) -> bool:
+        self._ensure_user_loaded(chat_id)
+        now_ts = float(now_ts if now_ts is not None else time.time())
+        has_rating = self.has_user_rating(chat_id)
+        has_feedback = self.has_user_feedback(chat_id)
+        if has_rating and has_feedback:
+            return False
+
+        engagement = self.engagement.setdefault(chat_id, {"last_feedback_nudge_ts": 0})
+        last_nudge_ts = float(engagement.get("last_feedback_nudge_ts", 0) or 0)
+        if now_ts - last_nudge_ts < FEEDBACK_NUDGE_COOLDOWN_SECONDS:
+            return False
+
+        history_count = len(self.history.get(chat_id, []))
+        is_active = history_count >= ACTIVE_USER_HISTORY_THRESHOLD or bool(self.auto_update.get(chat_id, {}).get("enabled"))
+        if (not has_rating and not has_feedback) or is_active:
+            return True
+        return False
+
+    def _send_feedback_nudge_if_needed(self, chat_id: int):
+        if not self._should_send_feedback_nudge(chat_id):
+            return
+        has_rating = self.has_user_rating(chat_id)
+        has_feedback = self.has_user_feedback(chat_id)
+        if not has_rating and not has_feedback:
+            message = (
+                "🙏 Допоможіть покращити PowerON: поставте оцінку та залиште короткий відгук.\n"
+                "Натисніть «⭐ Оцінка» та «📝 Відгук» на головному екрані."
+            )
+        elif not has_rating:
+            message = "🙏 Ви активно користуєтесь ботом. Будемо вдячні за оцінку: «⭐ Оцінка»."
+        else:
+            message = "🙏 Ви активно користуєтесь ботом. Будемо вдячні за короткий відгук: «📝 Відгук»."
+
+        self.bot.send_message(chat_id, message, reply_markup=self._home_keyboard())
+        self.engagement.setdefault(chat_id, {"last_feedback_nudge_ts": 0})["last_feedback_nudge_ts"] = time.time()
+        self._save_user_data(chat_id)
+
     def send_home(self, chat_id: int):
         self._ensure_user_loaded(chat_id)
         if chat_id not in self.seen_users:
@@ -557,6 +613,7 @@ class PowerOnWizard:
             return
 
         self.bot.send_message(chat_id, "⚡ PowerON готовий. Оберіть дію нижче 👇", reply_markup=self._home_keyboard())
+        self._send_feedback_nudge_if_needed(chat_id)
 
     def send_settings(self, chat_id: int):
         self._ensure_user_loaded(chat_id)
@@ -1189,6 +1246,7 @@ class PowerOnWizard:
             settings = self.auto_update.setdefault(chat_id, self._default_auto_update_settings())
             settings["last_signature"] = signature
             self._save_user_data(chat_id)
+            self._send_feedback_nudge_if_needed(chat_id)
         except PowerOnClientError as exc:
             self.metrics["schedule_failures"] += 1
             self.logger.warning("poweron.render_client_error chat_id=%s error=%s", chat_id, exc)
