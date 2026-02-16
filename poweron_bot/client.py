@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 BASE_API_URL = "https://api-poweron.toe.com.ua/api"
 BASE_SITE_URL = "https://poweron.toe.com.ua/"
+TERNOPIL_MAP_URL = "https://svitlo.ternopil.webcam/"
 CACHE_TTL_SECONDS = 600
 API_RETRIES = 3
 CAPTURE_RETRIES = 2
@@ -386,6 +387,51 @@ class PowerOnClient:
                 "Не вдалося отримати графік. Спробуйте ще раз або відкрийте вручну: https://poweron.toe.com.ua/"
             ) from last_error
 
+    async def render_ternopil_map_screenshot(self, force_refresh: bool = False) -> str:
+        cache_key = "ternopil_map"
+        self._cleanup_cache_files()
+        now = time.time()
+        cached = self._cache.get(cache_key)
+        if not force_refresh and cached and cached.expires_at > now and os.path.exists(cached.path):
+            self.metrics["cache_hits"] += 1
+            return cached.path
+
+        self.metrics["cache_misses"] += 1
+        lock = self._get_lock_for_current_loop(cache_key)
+        async with lock:
+            cached = self._cache.get(cache_key)
+            if not force_refresh and cached and cached.expires_at > now and os.path.exists(cached.path):
+                self.metrics["cache_hits"] += 1
+                return cached.path
+
+            file_hash = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
+            image_path = os.path.join(self.cache_dir, f"{file_hash}.png")
+
+            last_error = None
+            for attempt in range(1, CAPTURE_RETRIES + 1):
+                self.metrics["render_attempts"] += 1
+                self._record_timestamp("render_attempt_timestamps")
+                started = time.time()
+                try:
+                    await self._capture_ternopil_map(image_path)
+                    render_duration_ms = int((time.time() - started) * 1000)
+                    self.metrics["last_render_duration_ms"] = render_duration_ms
+                    self._record_latency("render_latencies_ms", render_duration_ms)
+                    self._cache[cache_key] = CacheRecord(path=image_path, expires_at=time.time() + CACHE_TTL_SECONDS)
+                    return image_path
+                except (PowerOnRenderError, TimeoutError, OSError) as exc:
+                    last_error = exc
+                    self.metrics["last_render_error"] = str(exc)
+                    self.metrics["render_failures"] += 1
+                    self._record_timestamp("render_failure_timestamps")
+                    self._record_latency("render_latencies_ms", int((time.time() - started) * 1000))
+                    if attempt < CAPTURE_RETRIES:
+                        await asyncio.sleep(0.75 * attempt)
+
+            raise PowerOnRenderError(
+                "Не вдалося отримати мапу світла Тернополя. Спробуйте ще раз або відкрийте вручну: https://svitlo.ternopil.webcam/"
+            ) from last_error
+
 
     @staticmethod
     def _browser_executable_candidates() -> List[str]:
@@ -463,6 +509,47 @@ class PowerOnClient:
                 await self._screenshot_graph_fragment(page, image_path)
             except (PlaywrightTimeoutError, PlaywrightError) as exc:
                 raise PowerOnRenderError("Помилка рендеру графіка на сайті.") from exc
+            finally:
+                await browser.close()
+
+    async def _capture_ternopil_map(self, image_path: str) -> None:
+        from playwright.async_api import Error as PlaywrightError
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            launch_kwargs = {"headless": True, "args": self._ubuntu_browser_launch_args()}
+            browser = None
+            launch_errors = []
+
+            try:
+                browser = await playwright.chromium.launch(**launch_kwargs)
+            except Exception as bundled_exc:
+                launch_errors.append(f"bundled_chromium={bundled_exc}")
+
+            if browser is None:
+                for candidate in self._browser_executable_candidates():
+                    try:
+                        browser = await playwright.chromium.launch(executable_path=candidate, **launch_kwargs)
+                        break
+                    except Exception as exc:
+                        launch_errors.append(f"{candidate}={exc}")
+
+            if browser is None:
+                errors_preview = "; ".join(launch_errors[:3])
+                raise PowerOnRenderError(
+                    "Не вдалося запустити браузер для скріншота мапи (Ubuntu 22.04). "
+                    "Встановіть Chromium: `sudo apt install chromium-browser` або задайте POWERON_BROWSER_PATH. "
+                    f"Деталі: {errors_preview}"
+                )
+
+            page = await browser.new_page(viewport={"width": 1440, "height": 2200})
+            try:
+                await page.goto(TERNOPIL_MAP_URL, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(1800)
+                await page.screenshot(path=image_path, full_page=True)
+            except (PlaywrightTimeoutError, PlaywrightError) as exc:
+                raise PowerOnRenderError("Помилка рендеру мапи світла Тернополя.") from exc
             finally:
                 await browser.close()
 
