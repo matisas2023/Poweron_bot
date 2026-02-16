@@ -98,15 +98,6 @@ class PowerOnClient:
         if len(bucket) > max_items:
             del bucket[:-max_items]
 
-    def _record_latency(self, key: str, duration_ms: int, max_items: int = 200) -> None:
-        bucket = self.metrics.get(key)
-        if not isinstance(bucket, list):
-            bucket = []
-            self.metrics[key] = bucket
-        bucket.append(max(0, int(duration_ms)))
-        if len(bucket) > max_items:
-            del bucket[:-max_items]
-
     def _get_lock_for_current_loop(self, cache_key: str) -> asyncio.Lock:
         current_loop = asyncio.get_running_loop()
         lock_record = self._locks.get(cache_key)
@@ -231,10 +222,10 @@ class PowerOnClient:
                 break
         return result
 
-    def _cleanup_cache_files(self) -> None:
+    def _cleanup_cache_files(self, force: bool = False) -> int:
         now = time.time()
-        if now - self._last_cache_cleanup_ts < CACHE_CLEANUP_INTERVAL_SECONDS:
-            return
+        if not force and now - self._last_cache_cleanup_ts < CACHE_CLEANUP_INTERVAL_SECONDS:
+            return 0
         self._last_cache_cleanup_ts = now
         removed_files = 0
 
@@ -268,8 +259,12 @@ class PowerOnClient:
                     pass
             self.metrics["cache_cleanup_runs"] += 1
             self.metrics["cache_files_deleted"] += removed_files
+            return removed_files
         except OSError:
-            return
+            return 0
+
+    def cleanup_cache_now(self) -> int:
+        return self._cleanup_cache_files(force=True)
 
     @staticmethod
     def _schedule_from_house_item(item: dict) -> dict:

@@ -62,6 +62,7 @@ def admin_keyboard() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton("🧪 Self-test логів", callback_data="admin:selftest_logs"))
     kb.add(types.InlineKeyboardButton("🖼 Self-test графіка", callback_data="admin:selftest_plot"))
     kb.add(types.InlineKeyboardButton("📥 Завантажити логи", callback_data="admin:download_logs"))
+    kb.add(types.InlineKeyboardButton("🧹 Очистити кеш", callback_data="admin:cache_cleanup"))
     kb.add(types.InlineKeyboardButton("👥 Експорт користувачів", callback_data="admin:users_export"))
     kb.add(types.InlineKeyboardButton("📝 Відгуки (перегляд)", callback_data="admin:feedback_view"))
     kb.add(types.InlineKeyboardButton("📥 Відгуки CSV", callback_data="admin:feedback_export"))
@@ -347,6 +348,7 @@ def main():
             f"• auto update: runs={wizard_metrics.get('auto_update_runs', 0)} notify={wizard_metrics.get('auto_update_notifications', 0)} heap={snapshot.get('auto_heap_size', 0)}\n"
             f"• render: attempts={client_metrics.get('render_attempts', 0)} fail={client_metrics.get('render_failures', 0)} fullpage_fallback={client_metrics.get('fullpage_fallbacks', 0)}\n"
             f"• cache: hits={client_metrics.get('cache_hits', 0)} miss={client_metrics.get('cache_misses', 0)}"
+            f"\n• cache cleanup runs={client_metrics.get('cache_cleanup_runs', 0)} deleted={client_metrics.get('cache_files_deleted', 0)}"
             f"\n• auto queue size: {snapshot.get('auto_heap_size', 0)}"
             f"\n• auto retry pressure: {sum(int((item or {}).get('failures', 0) or 0) for item in wizard.auto_update.values())}"
             f"\n{format_latency_block('API latency', client_metrics.get('api_latencies_ms', []))}"
@@ -406,6 +408,24 @@ def main():
         text_payload = "\n\n".join(snippets)[:3800]
         bot.send_message(chat_id, f"📄 Останні записи логів:\n\n{text_payload}")
         log_admin_action(user, "logs_tail", f"source={source} lines={lines}", chat_id=chat_id)
+
+    def run_cache_cleanup(chat_id: int, user, source: str):
+        deleted = wizard.client.cleanup_cache_now()
+        total_runs = wizard.client.metrics.get("cache_cleanup_runs", 0)
+        total_deleted = wizard.client.metrics.get("cache_files_deleted", 0)
+        log_admin_action(
+            user,
+            "cache_cleanup",
+            f"source={source} deleted={deleted} total_runs={total_runs} total_deleted={total_deleted}",
+            chat_id=chat_id,
+        )
+        bot.send_message(
+            chat_id,
+            "🧹 Очищення кешу виконано.\n"
+            f"• Видалено файлів зараз: {deleted}\n"
+            f"• Загалом запусків очищення: {total_runs}\n"
+            f"• Загалом видалено файлів: {total_deleted}",
+        )
 
     def build_feature_flags_text() -> str:
         flags = wizard.feature_flags
@@ -547,6 +567,12 @@ def main():
         if not is_admin(message.from_user.id):
             return
         send_logs_to_admin(message.chat.id, message.from_user, source="command")
+
+    @bot.message_handler(commands=["cache_cleanup"])
+    def cmd_cache_cleanup(message):
+        if not is_admin(message.from_user.id):
+            return
+        run_cache_cleanup(message.chat.id, message.from_user, source="command")
 
     @bot.message_handler(commands=["users_export"])
     def cmd_users_export(message):
@@ -702,6 +728,9 @@ def main():
             return
         if call.data == "admin:download_logs" and is_admin(call.from_user.id):
             send_logs_to_admin(call.message.chat.id, call.from_user, source="callback")
+            return
+        if call.data == "admin:cache_cleanup" and is_admin(call.from_user.id):
+            run_cache_cleanup(call.message.chat.id, call.from_user, source="callback")
             return
         if call.data == "admin:users_export" and is_admin(call.from_user.id):
             wizard._load_users_payload()

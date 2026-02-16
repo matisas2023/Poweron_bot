@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import MethodType
@@ -37,6 +38,20 @@ class ClientTests(unittest.TestCase):
             client._cleanup_cache_files()
             self.assertFalse(os.path.exists(old_path))
             self.assertGreaterEqual(client.metrics.get("cache_cleanup_runs", 0), 1)
+
+    def test_cleanup_cache_now_forces_cleanup_even_with_recent_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = PowerOnClient(cache_dir=tmp, enable_periodic_cleanup=False)
+            old_path = os.path.join(tmp, "old2.png")
+            with open(old_path, "wb") as f:
+                f.write(b"x")
+            os.utime(old_path, (0, 0))
+
+            client._last_cache_cleanup_ts = time.time()
+            removed = client.cleanup_cache_now()
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(os.path.exists(old_path))
 
     def test_browser_candidates_prefers_env_path(self):
         old = os.environ.get("POWERON_BROWSER_PATH")
@@ -257,26 +272,38 @@ class WizardFeedbackTests(unittest.TestCase):
     def test_feedback_nudge_for_new_user_without_rating_and_feedback(self):
         bot = DummyBot()
         wizard = PowerOnWizard(bot)
+        chat_id = int(time.time() * 1000) % 10_000_000 + 300000
 
-        wizard.seen_users.add(30)
-        wizard._ensure_user_loaded(30)
-        wizard.send_home(30)
+        with wizard._feedback_lock:
+            wizard._feedback_payload["entries"] = [item for item in wizard._feedback_payload.get("entries", []) if int(item.get("chat_id", 0)) != chat_id]
+            wizard._feedback_payload["ratings"].pop(str(chat_id), None)
+
+        wizard.seen_users.add(chat_id)
+        wizard._ensure_user_loaded(chat_id)
+        wizard.engagement[chat_id] = {"last_feedback_nudge_ts": 0}
+        wizard.send_home(chat_id)
 
         self.assertTrue(any("поставте оцінку" in text.lower() for _, text in bot.messages))
 
     def test_feedback_nudge_for_active_user_without_feedback(self):
         bot = DummyBot()
         wizard = PowerOnWizard(bot)
+        chat_id = int(time.time() * 1000) % 10_000_000 + 400000
 
-        wizard.set_user_rating(31, 5)
-        wizard.seen_users.add(31)
-        wizard._ensure_user_loaded(31)
-        wizard.history[31] = [
+        with wizard._feedback_lock:
+            wizard._feedback_payload["entries"] = [item for item in wizard._feedback_payload.get("entries", []) if int(item.get("chat_id", 0)) != chat_id]
+            wizard._feedback_payload["ratings"].pop(str(chat_id), None)
+
+        wizard.set_user_rating(chat_id, 5)
+        wizard.seen_users.add(chat_id)
+        wizard._ensure_user_loaded(chat_id)
+        wizard.engagement[chat_id] = {"last_feedback_nudge_ts": 0}
+        wizard.history[chat_id] = [
             {"cache_key": "1:2:1", "settlement_display": "A", "street_name": "S", "house_name": "1"},
             {"cache_key": "1:2:2", "settlement_display": "B", "street_name": "S", "house_name": "2"},
             {"cache_key": "1:2:3", "settlement_display": "C", "street_name": "S", "house_name": "3"},
         ]
-        wizard.send_home(31)
+        wizard.send_home(chat_id)
 
         self.assertTrue(any("короткий відгук" in text.lower() for _, text in bot.messages))
 
