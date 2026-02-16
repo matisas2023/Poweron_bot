@@ -25,7 +25,7 @@ class DummyBot:
 class ClientTests(unittest.TestCase):
     def test_cache_cleanup_removes_old_files(self):
         with tempfile.TemporaryDirectory() as tmp:
-            client = PowerOnClient(cache_dir=tmp)
+            client = PowerOnClient(cache_dir=tmp, enable_periodic_cleanup=False)
             old_path = os.path.join(tmp, "old.png")
             with open(old_path, "wb") as f:
                 f.write(b"x")
@@ -36,6 +36,7 @@ class ClientTests(unittest.TestCase):
             client._last_cache_cleanup_ts = 0
             client._cleanup_cache_files()
             self.assertFalse(os.path.exists(old_path))
+            self.assertGreaterEqual(client.metrics.get("cache_cleanup_runs", 0), 1)
 
     def test_browser_candidates_prefers_env_path(self):
         old = os.environ.get("POWERON_BROWSER_PATH")
@@ -51,7 +52,7 @@ class ClientTests(unittest.TestCase):
                 os.environ["POWERON_BROWSER_PATH"] = old
 
     def test_fetch_house_schedule_returns_target_house(self):
-        client = PowerOnClient(cache_dir=tempfile.mkdtemp())
+        client = PowerOnClient(cache_dir=tempfile.mkdtemp(), enable_periodic_cleanup=False)
 
         async def _fake_get_json(self, path, params=None):
             assert path == "/pw_houses"
@@ -71,7 +72,7 @@ class ClientTests(unittest.TestCase):
 
     def test_render_schedule_force_refresh_bypasses_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
-            client = PowerOnClient(cache_dir=tmp)
+            client = PowerOnClient(cache_dir=tmp, enable_periodic_cleanup=False)
             cache_key = "1:2:3"
             image_path = os.path.join(tmp, "cached.png")
             with open(image_path, "wb") as f:
@@ -109,6 +110,14 @@ class LoggingTests(unittest.TestCase):
 
 
 class WizardFallbackTests(unittest.TestCase):
+    def test_home_keyboard_has_single_home_button(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot)
+
+        kb = wizard._home_keyboard()
+        home_count = sum(1 for row in kb.keyboard for btn in row if (btn.get("text") if isinstance(btn, dict) else "") == "🏠 Додому")
+        self.assertEqual(home_count, 1)
+
     def test_send_schedule_falls_back_to_text(self):
         bot = DummyBot()
         wizard = PowerOnWizard(bot)
@@ -126,6 +135,7 @@ class WizardFallbackTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(bot.messages), 1)
         self.assertEqual(wizard.metrics["text_fallbacks"], 1)
+        self.assertGreaterEqual(len(wizard.metrics.get("schedule_latencies_ms", [])), 1)
 
     def test_build_entry_refreshes_schedule_from_api(self):
         bot = DummyBot()
@@ -167,10 +177,12 @@ class WizardFallbackTests(unittest.TestCase):
     def test_auto_update_can_select_specific_addresses(self):
         bot = DummyBot()
         wizard = PowerOnWizard(bot)
+        wizard._ensure_user_loaded(1)
         wizard.history[1] = [
             {"cache_key": "1:2:3", "settlement_display": "A", "street_name": "S", "house_name": "1"},
             {"cache_key": "1:2:4", "settlement_display": "B", "street_name": "S", "house_name": "2"},
         ]
+        wizard.auto_update[1] = wizard._default_auto_update_settings()
         call = type("Call", (), {"data": "poweron:auto_addr:1:2:4", "message": type("M", (), {"chat": type("C", (), {"id": 1})()})()})()
 
         handled = wizard.handle_callback(call)
@@ -241,6 +253,32 @@ class WizardFeedbackTests(unittest.TestCase):
         entries = wizard.get_feedback_entries()
         self.assertGreaterEqual(len(entries), 1)
         self.assertEqual(entries[-1]["chat_id"], 10)
+
+    def test_feedback_nudge_for_new_user_without_rating_and_feedback(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot)
+
+        wizard.seen_users.add(30)
+        wizard._ensure_user_loaded(30)
+        wizard.send_home(30)
+
+        self.assertTrue(any("поставте оцінку" in text.lower() for _, text in bot.messages))
+
+    def test_feedback_nudge_for_active_user_without_feedback(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot)
+
+        wizard.set_user_rating(31, 5)
+        wizard.seen_users.add(31)
+        wizard._ensure_user_loaded(31)
+        wizard.history[31] = [
+            {"cache_key": "1:2:1", "settlement_display": "A", "street_name": "S", "house_name": "1"},
+            {"cache_key": "1:2:2", "settlement_display": "B", "street_name": "S", "house_name": "2"},
+            {"cache_key": "1:2:3", "settlement_display": "C", "street_name": "S", "house_name": "3"},
+        ]
+        wizard.send_home(31)
+
+        self.assertTrue(any("короткий відгук" in text.lower() for _, text in bot.messages))
 
 
 if __name__ == "__main__":
