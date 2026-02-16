@@ -23,8 +23,9 @@ ACTIVE_USER_HISTORY_THRESHOLD = 3
 
 
 class PowerOnWizard:
-    def __init__(self, bot):
+    def __init__(self, bot, admin_user_id: Optional[int] = None):
         self.bot = bot
+        self.admin_user_id = admin_user_id
         self.logger = logging.getLogger("poweron_standalone")
         self.client = PowerOnClient()
         self.state: Dict[int, dict] = {}
@@ -34,6 +35,7 @@ class PowerOnWizard:
 
         self.auto_update: Dict[int, dict] = {}
         self.engagement: Dict[int, dict] = {}
+        self.profile: Dict[int, dict] = {}
         self.rate_limit: Dict[int, float] = {}
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -226,6 +228,7 @@ class PowerOnWizard:
             "pinned": self.pinned.get(chat_id, [])[:MAX_PINNED_ITEMS],
             "auto_update": self.auto_update.get(chat_id, self._default_auto_update_settings()),
             "engagement": self.engagement.get(chat_id, {"last_feedback_nudge_ts": 0}),
+            "profile": self.profile.get(chat_id, {"first_name": "", "username": "", "last_seen_ts": 0}),
         }
         self.store.upsert_chat(chat_id, self._users_payload[payload_key])
         self._save_users_payload()
@@ -260,6 +263,12 @@ class PowerOnWizard:
             self.engagement[chat_id] = {
                 "last_feedback_nudge_ts": float(engagement.get("last_feedback_nudge_ts", 0) or 0),
             }
+            profile = user_payload.get("profile") or {}
+            self.profile[chat_id] = {
+                "first_name": str(profile.get("first_name", "") or ""),
+                "username": str(profile.get("username", "") or ""),
+                "last_seen_ts": int(profile.get("last_seen_ts", 0) or 0),
+            }
 
             if user_payload.get("seen"):
                 self.seen_users.add(chat_id)
@@ -293,6 +302,12 @@ class PowerOnWizard:
         self.engagement[chat_id] = {
             "last_feedback_nudge_ts": float(engagement.get("last_feedback_nudge_ts", 0) or 0),
         }
+        profile = user_payload.get("profile") or {}
+        self.profile[chat_id] = {
+            "first_name": str(profile.get("first_name", "") or ""),
+            "username": str(profile.get("username", "") or ""),
+            "last_seen_ts": int(profile.get("last_seen_ts", 0) or 0),
+        }
 
         if user_payload.get("seen"):
             self.seen_users.add(chat_id)
@@ -307,7 +322,7 @@ class PowerOnWizard:
         )
         return kb
 
-    def _home_keyboard(self):
+    def _home_keyboard(self, chat_id: Optional[int] = None):
         kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
         kb.add(
             types.KeyboardButton("⚡ Графік"),
@@ -324,7 +339,31 @@ class PowerOnWizard:
             types.KeyboardButton("📝 Відгук"),
             types.KeyboardButton("🏠 Додому"),
         )
+        if chat_id is not None and self.admin_user_id is not None and int(chat_id) == int(self.admin_user_id):
+            kb.add(types.KeyboardButton("🛠 Адмін панель"))
         return kb
+
+    def touch_user_profile(self, chat_id: int, user=None):
+        self._ensure_user_loaded(chat_id)
+        current = self.profile.setdefault(chat_id, {"first_name": "", "username": "", "last_seen_ts": 0})
+        changed = False
+        if user is not None:
+            first_name = str(getattr(user, "first_name", "") or "")
+            username = str(getattr(user, "username", "") or "")
+            if first_name != current.get("first_name", ""):
+                current["first_name"] = first_name
+                changed = True
+            if username != current.get("username", ""):
+                current["username"] = username
+                changed = True
+
+        now_ts = int(time.time())
+        if now_ts != int(current.get("last_seen_ts", 0) or 0):
+            current["last_seen_ts"] = now_ts
+            changed = True
+
+        if changed:
+            self._save_user_data(chat_id)
 
     def _record_metric_latency(self, key: str, duration_ms: int, max_items: int = 200):
         values = self.metrics.get(key)
@@ -588,7 +627,7 @@ class PowerOnWizard:
         else:
             message = "🙏 Ви активно користуєтесь ботом. Будемо вдячні за короткий відгук: «📝 Відгук»."
 
-        self.bot.send_message(chat_id, message, reply_markup=self._home_keyboard())
+        self.bot.send_message(chat_id, message, reply_markup=self._home_keyboard(chat_id))
         self.engagement.setdefault(chat_id, {"last_feedback_nudge_ts": 0})["last_feedback_nudge_ts"] = time.time()
         self._save_user_data(chat_id)
 
@@ -608,11 +647,11 @@ class PowerOnWizard:
 3) Отримайте скріншот та ГПВ.
 
 Порада: закріпіть адресу у «📌 Адреси» для швидкого доступу.""",
-                reply_markup=self._home_keyboard(),
+                reply_markup=self._home_keyboard(chat_id),
             )
             return
 
-        self.bot.send_message(chat_id, "⚡ PowerON готовий. Оберіть дію нижче 👇", reply_markup=self._home_keyboard())
+        self.bot.send_message(chat_id, "⚡ PowerON готовий. Оберіть дію нижче 👇", reply_markup=self._home_keyboard(chat_id))
         self._send_feedback_nudge_if_needed(chat_id)
 
     def send_settings(self, chat_id: int):
@@ -659,11 +698,11 @@ class PowerOnWizard:
             return True
 
         if text in {"ℹ️ Статус", "📡 Статус"} or text.lower() == "/status":
-            self.bot.send_message(chat_id, self._status_text(chat_id), reply_markup=self._home_keyboard())
+            self.bot.send_message(chat_id, self._status_text(chat_id), reply_markup=self._home_keyboard(chat_id))
             return True
 
         if text.lower() in {"/faq", "faq"} or text in {"❓ FAQ"}:
-            self.bot.send_message(chat_id, self._faq_text(), reply_markup=self._home_keyboard())
+            self.bot.send_message(chat_id, self._faq_text(), reply_markup=self._home_keyboard(chat_id))
             return True
 
         if text in {"⭐ Оцінити бота", "⭐ Оцінка"}:
@@ -696,11 +735,11 @@ class PowerOnWizard:
             user = getattr(message, "from_user", None)
             if self.has_user_rating(chat_id):
                 self.state.pop(chat_id, None)
-                self.bot.send_message(chat_id, "ℹ️ Ви вже залишили оцінку. Дякуємо!", reply_markup=self._home_keyboard())
+                self.bot.send_message(chat_id, "ℹ️ Ви вже залишили оцінку. Дякуємо!", reply_markup=self._home_keyboard(chat_id))
                 return True
             self.set_user_rating(chat_id, rating)
             self.state.pop(chat_id, None)
-            self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard())
+            self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard(chat_id))
             return True
 
         if session and session.get("step") == "feedback_input":
@@ -715,7 +754,7 @@ class PowerOnWizard:
                 first_name=getattr(user, "first_name", "") or "",
             )
             self.state.pop(chat_id, None)
-            self.bot.send_message(chat_id, "✅ Дякуємо за відгук!", reply_markup=self._home_keyboard())
+            self.bot.send_message(chat_id, "✅ Дякуємо за відгук!", reply_markup=self._home_keyboard(chat_id))
             return True
 
         if session and session.get("step") == "auto_interval_input":
@@ -857,7 +896,7 @@ class PowerOnWizard:
 
         if data.startswith("poweron:rate:"):
             if self.has_user_rating(chat_id):
-                self.bot.send_message(chat_id, "ℹ️ Ви вже залишили оцінку. Дякуємо!", reply_markup=self._home_keyboard())
+                self.bot.send_message(chat_id, "ℹ️ Ви вже залишили оцінку. Дякуємо!", reply_markup=self._home_keyboard(chat_id))
                 return True
             try:
                 rating = int(data.rsplit(":", 1)[1])
@@ -866,7 +905,7 @@ class PowerOnWizard:
             if rating < 1 or rating > 5:
                 return True
             self.set_user_rating(chat_id, rating)
-            self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard())
+            self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard(chat_id))
             return True
 
         try:

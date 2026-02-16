@@ -133,6 +133,19 @@ class WizardFallbackTests(unittest.TestCase):
         home_count = sum(1 for row in kb.keyboard for btn in row if (btn.get("text") if isinstance(btn, dict) else "") == "🏠 Додому")
         self.assertEqual(home_count, 1)
 
+    def test_home_keyboard_shows_admin_panel_only_for_admin(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot, admin_user_id=42)
+
+        admin_kb = wizard._home_keyboard(chat_id=42)
+        regular_kb = wizard._home_keyboard(chat_id=43)
+
+        admin_has = any((btn.get("text") if isinstance(btn, dict) else "") == "🛠 Адмін панель" for row in admin_kb.keyboard for btn in row)
+        regular_has = any((btn.get("text") if isinstance(btn, dict) else "") == "🛠 Адмін панель" for row in regular_kb.keyboard for btn in row)
+
+        self.assertTrue(admin_has)
+        self.assertFalse(regular_has)
+
     def test_send_schedule_falls_back_to_text(self):
         bot = DummyBot()
         wizard = PowerOnWizard(bot)

@@ -54,23 +54,33 @@ def parse_admin_id(raw_value: str):
 
 
 def admin_keyboard() -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"))
-    kb.add(types.InlineKeyboardButton("📈 Аналітика", callback_data="admin:analytics"))
-    kb.add(types.InlineKeyboardButton("🩺 Стан сервісу", callback_data="admin:health"))
-    kb.add(types.InlineKeyboardButton("📣 Розсилка", callback_data="admin:broadcast"))
-    kb.add(types.InlineKeyboardButton("🧪 Self-test логів", callback_data="admin:selftest_logs"))
-    kb.add(types.InlineKeyboardButton("🖼 Self-test графіка", callback_data="admin:selftest_plot"))
-    kb.add(types.InlineKeyboardButton("📥 Завантажити логи", callback_data="admin:download_logs"))
-    kb.add(types.InlineKeyboardButton("🧹 Очистити кеш", callback_data="admin:cache_cleanup"))
-    kb.add(types.InlineKeyboardButton("👥 Експорт користувачів", callback_data="admin:users_export"))
-    kb.add(types.InlineKeyboardButton("📝 Відгуки (перегляд)", callback_data="admin:feedback_view"))
-    kb.add(types.InlineKeyboardButton("📥 Відгуки CSV", callback_data="admin:feedback_export"))
-    kb.add(types.InlineKeyboardButton("⭐ Загальна оцінка", callback_data="admin:ratings"))
-    kb.add(types.InlineKeyboardButton("📄 Останні записи логів", callback_data="admin:logs_tail"))
-    kb.add(types.InlineKeyboardButton("🎛 Прапорці функцій", callback_data="admin:feature_flags"))
-    kb.add(types.InlineKeyboardButton("🛑 Вимкнути сервер", callback_data="admin:shutdown"))
-    kb.add(types.InlineKeyboardButton("🔄 Перезапустити сервер", callback_data="admin:restart"))
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        types.InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
+        types.InlineKeyboardButton("📈 Аналітика", callback_data="admin:analytics"),
+        types.InlineKeyboardButton("🩺 Стан", callback_data="admin:health"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📣 Розсилка", callback_data="admin:broadcast"),
+        types.InlineKeyboardButton("📥 Логи", callback_data="admin:download_logs"),
+        types.InlineKeyboardButton("🧹 Кеш", callback_data="admin:cache_cleanup"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("👥 Користувачі", callback_data="admin:users_export"),
+        types.InlineKeyboardButton("📝 Відгуки", callback_data="admin:feedback_view"),
+        types.InlineKeyboardButton("⭐ Оцінки", callback_data="admin:ratings"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📥 Відгуки CSV", callback_data="admin:feedback_export"),
+        types.InlineKeyboardButton("📄 Tail логів", callback_data="admin:logs_tail"),
+        types.InlineKeyboardButton("🎛 Flags", callback_data="admin:feature_flags"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🧪 Selftest лог", callback_data="admin:selftest_logs"),
+        types.InlineKeyboardButton("🖼 Selftest PNG", callback_data="admin:selftest_plot"),
+        types.InlineKeyboardButton("🔄 Restart", callback_data="admin:restart"),
+    )
+    kb.add(types.InlineKeyboardButton("🛑 Shutdown", callback_data="admin:shutdown"))
     return kb
 
 
@@ -104,7 +114,7 @@ def main():
 
     allowed_ids = parse_allowed_ids(os.getenv("POWERON_ALLOWED_IDS", ""))
     bot = telebot.TeleBot(token)
-    wizard = PowerOnWizard(bot)
+    wizard = PowerOnWizard(bot, admin_user_id=admin_user_id)
     user_logger = get_user_logger()
     admin_logger = get_admin_logger()
     admin_broadcast_pending = set()
@@ -159,6 +169,9 @@ def main():
             getattr(user, "first_name", None),
             details,
         )
+        chat_id = getattr(chat, "id", None)
+        if chat_id is not None:
+            wizard.touch_user_profile(chat_id, user)
 
     def build_stats_text() -> str:
         wizard._load_users_payload()
@@ -381,11 +394,28 @@ def main():
         export_path = TMP_DIR / "users_export.csv"
         with export_path.open("w", encoding="utf-8", newline="") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(["chat_id", "seen", "history_count", "pinned_count", "auto_enabled", "auto_interval", "silent"])
+            writer.writerow([
+                "chat_id",
+                "first_name",
+                "username",
+                "last_seen_at",
+                "seen",
+                "history_count",
+                "pinned_count",
+                "auto_enabled",
+                "auto_interval",
+                "silent",
+            ])
             for chat_id_str, payload in wizard._users_payload.items():
                 auto = payload.get("auto_update") or {}
+                profile = payload.get("profile") or {}
+                last_seen_ts = int(profile.get("last_seen_ts", 0) or 0)
+                last_seen_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_seen_ts)) if last_seen_ts else ""
                 writer.writerow([
                     chat_id_str,
+                    profile.get("first_name", ""),
+                    profile.get("username", ""),
+                    last_seen_at,
                     int(bool(payload.get("seen"))),
                     len(payload.get("history") or []),
                     len(payload.get("pinned") or []),
@@ -393,6 +423,19 @@ def main():
                     int(auto.get("interval", 60) or 60),
                     int(bool(auto.get("silent", True))),
                 ])
+
+        rows = []
+        for chat_id_str, payload in list(wizard._users_payload.items())[:20]:
+            profile = payload.get("profile") or {}
+            last_seen_ts = int(profile.get("last_seen_ts", 0) or 0)
+            last_seen_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(last_seen_ts)) if last_seen_ts else "—"
+            username = profile.get("username", "") or "—"
+            rows.append((chat_id_str, (profile.get("first_name", "") or "—")[:12], username[:12], last_seen_at))
+        table = ["chat_id      | first_name   | username     | last_seen"]
+        table.append("-" * 62)
+        for row in rows:
+            table.append(f"{str(row[0])[:12]:<12} | {row[1]:<12} | {row[2]:<12} | {row[3]}")
+        bot.send_message(chat_id, "👥 Користувачі (таблиця, top 20):\n```\n" + "\n".join(table) + "\n```", parse_mode="Markdown")
         with export_path.open("rb") as csv_file:
             bot.send_document(chat_id, csv_file, visible_file_name="users_export.csv", caption="👥 Експорт користувачів")
         log_admin_action(user, "users_export", f"source={source}", chat_id=chat_id)
@@ -660,6 +703,11 @@ def main():
                 f"📣 Попередній перегляд розсилки:\n\n{text}\n\nПідтвердити відправку?",
                 reply_markup=broadcast_confirm_keyboard(),
             )
+            return
+
+        if is_admin(message.from_user.id) and text in {"🛠 Адмін панель", "Адмін панель"}:
+            log_admin_action(message.from_user, "admin_menu_open_button", chat_id=message.chat.id)
+            bot.send_message(message.chat.id, "🛠 Адмін-меню:", reply_markup=admin_keyboard())
             return
 
         if wizard.handle_message(message):
