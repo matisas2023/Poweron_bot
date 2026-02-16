@@ -6,6 +6,7 @@ import csv
 import tempfile
 import threading
 import time
+import statistics
 from pathlib import Path
 from typing import Optional
 
@@ -53,22 +54,36 @@ def parse_admin_id(raw_value: str):
 
 
 def admin_keyboard() -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"))
-    kb.add(types.InlineKeyboardButton("📈 Аналітика", callback_data="admin:analytics"))
-    kb.add(types.InlineKeyboardButton("🩺 Стан сервісу", callback_data="admin:health"))
-    kb.add(types.InlineKeyboardButton("📣 Розсилка", callback_data="admin:broadcast"))
-    kb.add(types.InlineKeyboardButton("🧪 Self-test логів", callback_data="admin:selftest_logs"))
-    kb.add(types.InlineKeyboardButton("🖼 Self-test графіка", callback_data="admin:selftest_plot"))
-    kb.add(types.InlineKeyboardButton("📥 Завантажити логи", callback_data="admin:download_logs"))
-    kb.add(types.InlineKeyboardButton("👥 Експорт користувачів", callback_data="admin:users_export"))
-    kb.add(types.InlineKeyboardButton("📝 Відгуки (перегляд)", callback_data="admin:feedback_view"))
-    kb.add(types.InlineKeyboardButton("📥 Відгуки CSV", callback_data="admin:feedback_export"))
-    kb.add(types.InlineKeyboardButton("⭐ Загальна оцінка", callback_data="admin:ratings"))
-    kb.add(types.InlineKeyboardButton("📄 Останні записи логів", callback_data="admin:logs_tail"))
-    kb.add(types.InlineKeyboardButton("🎛 Прапорці функцій", callback_data="admin:feature_flags"))
-    kb.add(types.InlineKeyboardButton("🛑 Вимкнути сервер", callback_data="admin:shutdown"))
-    kb.add(types.InlineKeyboardButton("🔄 Перезапустити сервер", callback_data="admin:restart"))
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        types.InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
+        types.InlineKeyboardButton("📈 Аналітика", callback_data="admin:analytics"),
+        types.InlineKeyboardButton("🩺 Стан", callback_data="admin:health"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📣 Розсилка", callback_data="admin:broadcast"),
+        types.InlineKeyboardButton("📥 Логи", callback_data="admin:download_logs"),
+        types.InlineKeyboardButton("🧹 Кеш", callback_data="admin:cache_cleanup"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("👥 Користувачі", callback_data="admin:users_export"),
+        types.InlineKeyboardButton("📝 Відгуки", callback_data="admin:feedback_view"),
+        types.InlineKeyboardButton("⭐ Оцінки", callback_data="admin:ratings"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📥 Відгуки CSV", callback_data="admin:feedback_export"),
+        types.InlineKeyboardButton("📄 Tail логів", callback_data="admin:logs_tail"),
+        types.InlineKeyboardButton("🎛 Flags", callback_data="admin:feature_flags"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🧪 Selftest лог", callback_data="admin:selftest_logs"),
+        types.InlineKeyboardButton("🖼 Selftest PNG", callback_data="admin:selftest_plot"),
+        types.InlineKeyboardButton("🚨 Інцидент", callback_data="admin:incident"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🔄 Restart", callback_data="admin:restart"),
+        types.InlineKeyboardButton("🛑 Shutdown", callback_data="admin:shutdown"),
+    )
     return kb
 
 
@@ -102,11 +117,49 @@ def main():
 
     allowed_ids = parse_allowed_ids(os.getenv("POWERON_ALLOWED_IDS", ""))
     bot = telebot.TeleBot(token)
-    wizard = PowerOnWizard(bot)
+    wizard = PowerOnWizard(bot, admin_user_id=admin_user_id)
     user_logger = get_user_logger()
     admin_logger = get_admin_logger()
     admin_broadcast_pending = set()
     admin_broadcast_draft = {}
+
+    def metric_percentile(values, percent: float) -> int:
+        if not values:
+            return 0
+        sorted_values = sorted(int(v) for v in values)
+        if len(sorted_values) == 1:
+            return sorted_values[0]
+        pos = int(round((len(sorted_values) - 1) * (percent / 100.0)))
+        pos = max(0, min(pos, len(sorted_values) - 1))
+        return sorted_values[pos]
+
+    def format_latency_block(label: str, values: list) -> str:
+        if not values:
+            return f"• {label}: n/a"
+        return (
+            f"• {label}: avg={int(statistics.mean(values))}ms "
+            f"p50={metric_percentile(values, 50)}ms p95={metric_percentile(values, 95)}ms n={len(values)}"
+        )
+
+    def rolling_count(timestamps: list, window_seconds: int) -> int:
+        if not timestamps:
+            return 0
+        now_ts = int(time.time())
+        return sum(1 for item in timestamps if now_ts - int(item) <= window_seconds)
+
+    def rolling_error_rate(requests_key: str, failures_key: str, window_seconds: int = 3600) -> float:
+        req = rolling_count(wizard.client.metrics.get(requests_key, []), window_seconds)
+        fail = rolling_count(wizard.client.metrics.get(failures_key, []), window_seconds)
+        if req <= 0:
+            return 0.0
+        return round((fail / req) * 100.0, 2)
+
+    def update_degraded_mode() -> bool:
+        api_error_rate = rolling_error_rate("api_request_timestamps", "api_failure_timestamps", 3600)
+        render_error_rate = rolling_error_rate("render_attempt_timestamps", "render_failure_timestamps", 3600)
+        degraded = api_error_rate >= 25.0 or render_error_rate >= 30.0
+        wizard.feature_flags["degraded_mode"] = degraded
+        return degraded
 
     def is_allowed(message):
         user_id = getattr(message.from_user, "id", None)
@@ -139,6 +192,9 @@ def main():
             getattr(user, "first_name", None),
             details,
         )
+        chat_id = getattr(chat, "id", None)
+        if chat_id is not None:
+            wizard.touch_user_profile(chat_id, user)
 
     def build_stats_text() -> str:
         wizard._load_users_payload()
@@ -256,6 +312,7 @@ def main():
         failed = 0
         failures = []
         started = time.time()
+        delivery_latencies = []
 
         for idx, chat_id_str in enumerate(wizard._users_payload.keys(), start=1):
             try:
@@ -266,11 +323,31 @@ def main():
                 continue
 
             try:
+                send_started = time.time()
                 bot.send_message(chat_id, f"📣 Повідомлення від адміністратора:\n\n{text}")
                 sent += 1
+                delivery_latencies.append(int((time.time() - send_started) * 1000))
             except Exception as exc:
                 failed += 1
                 failures.append(type(exc).__name__)
+                error_text = str(exc).lower()
+                if "429" in error_text or "too many requests" in error_text:
+                    time.sleep(1.5)
+                elif "timed out" in error_text or "timeout" in error_text:
+                    time.sleep(0.8)
+
+                for retry in range(2):
+                    backoff = 0.4 * (2 ** retry)
+                    time.sleep(backoff)
+                    try:
+                        send_started = time.time()
+                        bot.send_message(chat_id, f"📣 Повідомлення від адміністратора:\n\n{text}")
+                        sent += 1
+                        failed = max(0, failed - 1)
+                        delivery_latencies.append(int((time.time() - send_started) * 1000))
+                        break
+                    except Exception as retry_exc:
+                        failures.append(type(retry_exc).__name__)
 
             if idx % 25 == 0:
                 time.sleep(0.3)
@@ -281,6 +358,7 @@ def main():
             "failed": failed,
             "duration_ms": duration_ms,
             "failure_types": sorted(set(failures))[:8],
+            "delivery_latencies_ms": delivery_latencies,
         }
 
     def build_health_text() -> str:
@@ -293,6 +371,9 @@ def main():
             api_error = str(exc)
 
         cache_ok = os.path.isdir(wizard.client.cache_dir)
+        degraded = update_degraded_mode()
+        api_error_rate_1h = rolling_error_rate("api_request_timestamps", "api_failure_timestamps", 3600)
+        render_error_rate_1h = rolling_error_rate("render_attempt_timestamps", "render_failure_timestamps", 3600)
         snapshot = wizard.health_snapshot()
         wizard_metrics = snapshot.get("wizard", {})
         client_metrics = snapshot.get("client", {})
@@ -306,15 +387,27 @@ def main():
             f"• auto update: runs={wizard_metrics.get('auto_update_runs', 0)} notify={wizard_metrics.get('auto_update_notifications', 0)} heap={snapshot.get('auto_heap_size', 0)}\n"
             f"• render: attempts={client_metrics.get('render_attempts', 0)} fail={client_metrics.get('render_failures', 0)} fullpage_fallback={client_metrics.get('fullpage_fallbacks', 0)}\n"
             f"• cache: hits={client_metrics.get('cache_hits', 0)} miss={client_metrics.get('cache_misses', 0)}"
+            f"\n• cache cleanup runs={client_metrics.get('cache_cleanup_runs', 0)} deleted={client_metrics.get('cache_files_deleted', 0)}"
+            f"\n• low-disk guard triggers: {client_metrics.get('low_disk_guard_triggers', 0)}"
+            f"\n• auto queue size: {snapshot.get('auto_heap_size', 0)}"
+            f"\n• auto retry pressure: {sum(int((item or {}).get('failures', 0) or 0) for item in wizard.auto_update.values())}"
+            f"\n• error-rate 1h: api={api_error_rate_1h}% render={render_error_rate_1h}%"
+            f"\n• degraded mode: {'🟡 ON' if degraded else '🟢 OFF'}"
+            f"\n{format_latency_block('API latency', client_metrics.get('api_latencies_ms', []))}"
+            f"\n{format_latency_block('Render latency', client_metrics.get('render_latencies_ms', []))}"
+            f"\n{format_latency_block('Schedule latency', wizard_metrics.get('schedule_latencies_ms', []))}"
             + (f"\n• API error: {api_error}" if api_error else "")
         )
 
     def build_analytics_text() -> str:
+        degraded = update_degraded_mode()
         snapshot = wizard.health_snapshot()
         wizard_metrics = snapshot.get("wizard", {})
         client_metrics = snapshot.get("client", {})
         users_total = len(wizard._users_payload)
         dau = sum(1 for item in wizard._users_payload.values() if item.get("seen"))
+        api_error_rate_1h = rolling_error_rate("api_request_timestamps", "api_failure_timestamps", 3600)
+        render_error_rate_1h = rolling_error_rate("render_attempt_timestamps", "render_failure_timestamps", 3600)
         return (
             "📈 Analytics\n"
             f"• Users total: {users_total}\n"
@@ -322,29 +415,98 @@ def main():
             f"• schedule req/success/fail: {wizard_metrics.get('schedule_requests', 0)}/{wizard_metrics.get('schedule_success', 0)}/{wizard_metrics.get('schedule_failures', 0)}\n"
             f"• auto notifications: {wizard_metrics.get('auto_update_notifications', 0)}\n"
             f"• render fail: {client_metrics.get('render_failures', 0)}\n"
-            f"• last render ms: {wizard_metrics.get('last_render_ms', 0)}"
+            f"• error-rate 1h: api={api_error_rate_1h}% render={render_error_rate_1h}%\n"
+            f"• degraded mode: {'ON' if degraded else 'OFF'}\n"
+            f"• last render ms: {wizard_metrics.get('last_render_ms', 0)}\n"
+            f"{format_latency_block('API latency', client_metrics.get('api_latencies_ms', []))}\n"
+            f"{format_latency_block('Render latency', client_metrics.get('render_latencies_ms', []))}\n"
+            f"{format_latency_block('Schedule latency', wizard_metrics.get('schedule_latencies_ms', []))}"
         )
 
-    def send_users_export(chat_id: int, user, source: str):
+    def send_users_export(chat_id: int, user, source: str, mode: str = "all"):
         TMP_DIR.mkdir(parents=True, exist_ok=True)
         export_path = TMP_DIR / "users_export.csv"
+        now_ts = int(time.time())
+        users_items = list(wizard._users_payload.items())
+
+        def _is_active(payload: dict) -> bool:
+            last_seen_ts = int((payload.get("profile") or {}).get("last_seen_ts", 0) or 0)
+            return last_seen_ts > 0 and (now_ts - last_seen_ts) <= 7 * 24 * 3600
+
+        if mode == "active":
+            users_items = [(cid, pl) for cid, pl in users_items if _is_active(pl)]
+        elif mode == "auto":
+            users_items = [(cid, pl) for cid, pl in users_items if bool((pl.get("auto_update") or {}).get("enabled"))]
+
+        users_items.sort(key=lambda item: int((item[1].get("profile") or {}).get("last_seen_ts", 0) or 0), reverse=True)
+
         with export_path.open("w", encoding="utf-8", newline="") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(["chat_id", "seen", "history_count", "pinned_count", "auto_enabled", "auto_interval", "silent"])
-            for chat_id_str, payload in wizard._users_payload.items():
+            writer.writerow([
+                "chat_id",
+                "first_name",
+                "username",
+                "last_seen_at",
+                "days_since_last_seen",
+                "seen",
+                "history_count",
+                "pinned_count",
+                "auto_enabled",
+                "auto_addresses_count",
+                "auto_interval",
+                "silent",
+                "has_rating",
+                "has_feedback",
+            ])
+            for chat_id_str, payload in users_items:
                 auto = payload.get("auto_update") or {}
+                profile = payload.get("profile") or {}
+                last_seen_ts = int(profile.get("last_seen_ts", 0) or 0)
+                last_seen_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_seen_ts)) if last_seen_ts else ""
+                days_since_last_seen = ((now_ts - last_seen_ts) // 86400) if last_seen_ts else ""
+                has_rating = int(wizard.has_user_rating(int(chat_id_str)))
+                has_feedback = int(wizard.has_user_feedback(int(chat_id_str)))
                 writer.writerow([
                     chat_id_str,
+                    profile.get("first_name", ""),
+                    profile.get("username", ""),
+                    last_seen_at,
+                    days_since_last_seen,
                     int(bool(payload.get("seen"))),
                     len(payload.get("history") or []),
                     len(payload.get("pinned") or []),
                     int(bool(auto.get("enabled"))),
+                    len(auto.get("selected_keys") or []),
                     int(auto.get("interval", 60) or 60),
                     int(bool(auto.get("silent", True))),
+                    has_rating,
+                    has_feedback,
                 ])
+
+        rows = []
+        for chat_id_str, payload in users_items[:20]:
+            profile = payload.get("profile") or {}
+            last_seen_ts = int(profile.get("last_seen_ts", 0) or 0)
+            last_seen_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(last_seen_ts)) if last_seen_ts else "—"
+            username = profile.get("username", "") or "—"
+            rows.append((chat_id_str, (profile.get("first_name", "") or "—")[:12], username[:12], last_seen_at))
+        table = ["chat_id      | first_name   | username     | last_seen"]
+        table.append("-" * 62)
+        for row in rows:
+            table.append(f"{str(row[0])[:12]:<12} | {row[1]:<12} | {row[2]:<12} | {row[3]}")
+        bot.send_message(chat_id, f"👥 Користувачі (режим: {mode}, таблиця top 20):\n```\n" + "\n".join(table) + "\n```", parse_mode="Markdown")
         with export_path.open("rb") as csv_file:
             bot.send_document(chat_id, csv_file, visible_file_name="users_export.csv", caption="👥 Експорт користувачів")
-        log_admin_action(user, "users_export", f"source={source}", chat_id=chat_id)
+        log_admin_action(user, "users_export", f"source={source} mode={mode} rows={len(users_items)}", chat_id=chat_id)
+
+    def users_export_keyboard() -> types.InlineKeyboardMarkup:
+        kb = types.InlineKeyboardMarkup(row_width=3)
+        kb.add(
+            types.InlineKeyboardButton("Всі", callback_data="admin:users_export_mode:all"),
+            types.InlineKeyboardButton("Активні 7д", callback_data="admin:users_export_mode:active"),
+            types.InlineKeyboardButton("Auto ON", callback_data="admin:users_export_mode:auto"),
+        )
+        return kb
 
     def send_logs_tail(chat_id: int, user, source: str, lines: int = 100):
         snippets = []
@@ -357,6 +519,38 @@ def main():
         text_payload = "\n\n".join(snippets)[:3800]
         bot.send_message(chat_id, f"📄 Останні записи логів:\n\n{text_payload}")
         log_admin_action(user, "logs_tail", f"source={source} lines={lines}", chat_id=chat_id)
+
+    def run_cache_cleanup(chat_id: int, user, source: str):
+        deleted = wizard.client.cleanup_cache_now()
+        total_runs = wizard.client.metrics.get("cache_cleanup_runs", 0)
+        total_deleted = wizard.client.metrics.get("cache_files_deleted", 0)
+        log_admin_action(
+            user,
+            "cache_cleanup",
+            f"source={source} deleted={deleted} total_runs={total_runs} total_deleted={total_deleted}",
+            chat_id=chat_id,
+        )
+        bot.send_message(
+            chat_id,
+            "🧹 Очищення кешу виконано.\n"
+            f"• Видалено файлів зараз: {deleted}\n"
+            f"• Загалом запусків очищення: {total_runs}\n"
+            f"• Загалом видалено файлів: {total_deleted}",
+        )
+
+    def run_incident_action(chat_id: int, user, source: str):
+        deleted = wizard.client.cleanup_cache_now()
+        health_text = build_health_text()
+        tail_lines = []
+        for log_file in (LOGS_DIR / "admin_actions.log", LOGS_DIR / "user_entries.log"):
+            if not log_file.exists():
+                tail_lines.append(f"{log_file.name}: файл відсутній")
+                continue
+            content = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-10:]
+            tail_lines.append(f"{log_file.name}:\n" + "\n".join(content))
+        payload = "\n\n".join(tail_lines)[:3000]
+        log_admin_action(user, "incident_bundle", f"source={source} deleted={deleted}", chat_id=chat_id)
+        bot.send_message(chat_id, f"🚨 Incident bundle:\n• cache cleaned now: {deleted}\n\n{health_text}\n\n📄 Tail:\n{payload}")
 
     def build_feature_flags_text() -> str:
         flags = wizard.feature_flags
@@ -499,12 +693,23 @@ def main():
             return
         send_logs_to_admin(message.chat.id, message.from_user, source="command")
 
+    @bot.message_handler(commands=["cache_cleanup"])
+    def cmd_cache_cleanup(message):
+        if not is_admin(message.from_user.id):
+            return
+        run_cache_cleanup(message.chat.id, message.from_user, source="command")
+
     @bot.message_handler(commands=["users_export"])
     def cmd_users_export(message):
         if not is_admin(message.from_user.id):
             return
         wizard._load_users_payload()
-        send_users_export(message.chat.id, message.from_user, source="command")
+        parts = (message.text or "").split()
+        mode = parts[1].strip().lower() if len(parts) >= 2 else "all"
+        if mode not in {"all", "active", "auto"}:
+            bot.send_message(message.chat.id, "Доступні режими: all | active | auto", reply_markup=users_export_keyboard())
+            return
+        send_users_export(message.chat.id, message.from_user, source="command", mode=mode)
 
     @bot.message_handler(commands=["feedback_view"])
     def cmd_feedback_view(message):
@@ -587,6 +792,11 @@ def main():
             )
             return
 
+        if is_admin(message.from_user.id) and text in {"🛠 Адмін панель", "Адмін панель"}:
+            log_admin_action(message.from_user, "admin_menu_open_button", chat_id=message.chat.id)
+            bot.send_message(message.chat.id, "🛠 Адмін-меню:", reply_markup=admin_keyboard())
+            return
+
         if wizard.handle_message(message):
             return
         if text.lower() in {"/start", "start", "старт", "🚀 старт"}:
@@ -636,6 +846,7 @@ def main():
                 f"Надіслано: {broadcast_result['sent']}\n"
                 f"Помилок: {broadcast_result['failed']}\n"
                 f"Тривалість: {broadcast_result['duration_ms']} мс\n"
+                f"{format_latency_block('Delivery latency', broadcast_result.get('delivery_latencies_ms', []))}\n"
                 f"Типи помилок: {', '.join(broadcast_result['failure_types']) if broadcast_result['failure_types'] else '—'}",
             )
             return
@@ -653,9 +864,19 @@ def main():
         if call.data == "admin:download_logs" and is_admin(call.from_user.id):
             send_logs_to_admin(call.message.chat.id, call.from_user, source="callback")
             return
+        if call.data == "admin:cache_cleanup" and is_admin(call.from_user.id):
+            run_cache_cleanup(call.message.chat.id, call.from_user, source="callback")
+            return
         if call.data == "admin:users_export" and is_admin(call.from_user.id):
             wizard._load_users_payload()
-            send_users_export(call.message.chat.id, call.from_user, source="callback")
+            bot.send_message(call.message.chat.id, "Оберіть режим експорту:", reply_markup=users_export_keyboard())
+            return
+        if call.data.startswith("admin:users_export_mode:") and is_admin(call.from_user.id):
+            wizard._load_users_payload()
+            mode = call.data.rsplit(":", 1)[1]
+            if mode not in {"all", "active", "auto"}:
+                mode = "all"
+            send_users_export(call.message.chat.id, call.from_user, source="callback", mode=mode)
             return
         if call.data == "admin:logs_tail" and is_admin(call.from_user.id):
             send_logs_tail(call.message.chat.id, call.from_user, source="callback")
@@ -697,6 +918,9 @@ def main():
                 reply_markup=feature_flags_keyboard(wizard.feature_flags),
             )
             bot.answer_callback_query(call.id, f"{flag_name}: {'ON' if wizard.feature_flags[flag_name] else 'OFF'}")
+            return
+        if call.data == "admin:incident" and is_admin(call.from_user.id):
+            run_incident_action(call.message.chat.id, call.from_user, source="callback")
             return
         if call.data == "admin:shutdown" and is_admin(call.from_user.id):
             log_admin_action(call.from_user, "shutdown", chat_id=call.message.chat.id)

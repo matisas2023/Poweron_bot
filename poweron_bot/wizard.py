@@ -18,11 +18,14 @@ MAX_HISTORY_ITEMS = 6
 MAX_PINNED_ITEMS = 6
 AUTO_UPDATE_FAILURE_THRESHOLD = 3
 AUTO_UPDATE_COOLDOWN_SECONDS = 15 * 60
+FEEDBACK_NUDGE_COOLDOWN_SECONDS = 7 * 24 * 60 * 60
+ACTIVE_USER_HISTORY_THRESHOLD = 3
 
 
 class PowerOnWizard:
-    def __init__(self, bot):
+    def __init__(self, bot, admin_user_id: Optional[int] = None):
         self.bot = bot
+        self.admin_user_id = admin_user_id
         self.logger = logging.getLogger("poweron_standalone")
         self.client = PowerOnClient()
         self.state: Dict[int, dict] = {}
@@ -31,6 +34,8 @@ class PowerOnWizard:
         self.seen_users = set()
 
         self.auto_update: Dict[int, dict] = {}
+        self.engagement: Dict[int, dict] = {}
+        self.profile: Dict[int, dict] = {}
         self.rate_limit: Dict[int, float] = {}
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,6 +57,7 @@ class PowerOnWizard:
             "quiet_hours_enabled": True,
             "text_mode_cooldown": True,
             "compare_enabled": True,
+            "degraded_mode": False,
         }
 
         self.metrics = {
@@ -62,6 +68,7 @@ class PowerOnWizard:
             "auto_update_runs": 0,
             "auto_update_notifications": 0,
             "last_render_ms": 0,
+            "schedule_latencies_ms": [],
         }
         self._auto_update_heap = []
 
@@ -137,6 +144,12 @@ class PowerOnWizard:
         with self._feedback_lock:
             ratings = self._feedback_payload.get("ratings") or {}
             return str(chat_id) in ratings
+
+    def has_user_feedback(self, chat_id: int) -> bool:
+        with self._feedback_lock:
+            entries = self._feedback_payload.get("entries") or []
+            chat_id_value = int(chat_id)
+            return any(int((item or {}).get("chat_id", 0) or 0) == chat_id_value for item in entries)
 
     def get_feedback_entries(self) -> List[dict]:
         with self._feedback_lock:
@@ -215,6 +228,8 @@ class PowerOnWizard:
             "history": self.history.get(chat_id, [])[:MAX_HISTORY_ITEMS],
             "pinned": self.pinned.get(chat_id, [])[:MAX_PINNED_ITEMS],
             "auto_update": self.auto_update.get(chat_id, self._default_auto_update_settings()),
+            "engagement": self.engagement.get(chat_id, {"last_feedback_nudge_ts": 0}),
+            "profile": self.profile.get(chat_id, {"first_name": "", "username": "", "last_seen_ts": 0}),
         }
         self.store.upsert_chat(chat_id, self._users_payload[payload_key])
         self._save_users_payload()
@@ -245,6 +260,16 @@ class PowerOnWizard:
                 "failures": int(auto_update.get("failures", 0) or 0),
                 "text_mode_until": float(auto_update.get("text_mode_until", 0) or 0),
             }
+            engagement = user_payload.get("engagement") or {}
+            self.engagement[chat_id] = {
+                "last_feedback_nudge_ts": float(engagement.get("last_feedback_nudge_ts", 0) or 0),
+            }
+            profile = user_payload.get("profile") or {}
+            self.profile[chat_id] = {
+                "first_name": str(profile.get("first_name", "") or ""),
+                "username": str(profile.get("username", "") or ""),
+                "last_seen_ts": int(profile.get("last_seen_ts", 0) or 0),
+            }
 
             if user_payload.get("seen"):
                 self.seen_users.add(chat_id)
@@ -274,6 +299,16 @@ class PowerOnWizard:
             "failures": int(auto_update.get("failures", 0) or 0),
             "text_mode_until": float(auto_update.get("text_mode_until", 0) or 0),
         }
+        engagement = user_payload.get("engagement") or {}
+        self.engagement[chat_id] = {
+            "last_feedback_nudge_ts": float(engagement.get("last_feedback_nudge_ts", 0) or 0),
+        }
+        profile = user_payload.get("profile") or {}
+        self.profile[chat_id] = {
+            "first_name": str(profile.get("first_name", "") or ""),
+            "username": str(profile.get("username", "") or ""),
+            "last_seen_ts": int(profile.get("last_seen_ts", 0) or 0),
+        }
 
         if user_payload.get("seen"):
             self.seen_users.add(chat_id)
@@ -288,7 +323,7 @@ class PowerOnWizard:
         )
         return kb
 
-    def _home_keyboard(self):
+    def _home_keyboard(self, chat_id: Optional[int] = None):
         kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
         kb.add(
             types.KeyboardButton("⚡ Графік"),
@@ -300,13 +335,47 @@ class PowerOnWizard:
             types.KeyboardButton("📡 Статус"),
             types.KeyboardButton("❓ FAQ"),
         )
+        if chat_id is not None and self.admin_user_id is not None and int(chat_id) == int(self.admin_user_id):
+            kb.add(types.KeyboardButton("🗺 Мапа світла (Тернопіль)"))
         kb.add(
             types.KeyboardButton("⭐ Оцінка"),
             types.KeyboardButton("📝 Відгук"),
             types.KeyboardButton("🏠 Додому"),
         )
-        kb.add(types.KeyboardButton("🏠 Додому"))
+        if chat_id is not None and self.admin_user_id is not None and int(chat_id) == int(self.admin_user_id):
+            kb.add(types.KeyboardButton("🛠 Адмін панель"))
         return kb
+
+    def touch_user_profile(self, chat_id: int, user=None):
+        self._ensure_user_loaded(chat_id)
+        current = self.profile.setdefault(chat_id, {"first_name": "", "username": "", "last_seen_ts": 0})
+        changed = False
+        if user is not None:
+            first_name = str(getattr(user, "first_name", "") or "")
+            username = str(getattr(user, "username", "") or "")
+            if first_name != current.get("first_name", ""):
+                current["first_name"] = first_name
+                changed = True
+            if username != current.get("username", ""):
+                current["username"] = username
+                changed = True
+
+        now_ts = int(time.time())
+        if now_ts != int(current.get("last_seen_ts", 0) or 0):
+            current["last_seen_ts"] = now_ts
+            changed = True
+
+        if changed:
+            self._save_user_data(chat_id)
+
+    def _record_metric_latency(self, key: str, duration_ms: int, max_items: int = 200):
+        values = self.metrics.get(key)
+        if not isinstance(values, list):
+            values = []
+            self.metrics[key] = values
+        values.append(max(0, int(duration_ms)))
+        if len(values) > max_items:
+            del values[:-max_items]
 
     @staticmethod
     def _address_caption(item: dict) -> str:
@@ -460,8 +529,8 @@ class PowerOnWizard:
         )
         return kb
 
-    def _faq_text(self) -> str:
-        return (
+    def _faq_text(self, chat_id: Optional[int] = None) -> str:
+        lines = [
             "❓ FAQ PowerON\n"
             "────────────\n"
             "• Як почати? Натисніть «⚡ Перевірити графік», оберіть населений пункт, вулицю, будинок.\n"
@@ -471,6 +540,22 @@ class PowerOnWizard:
             "• Тихий режим: надсилання лише при зміні графіка.\n"
             "• Оцінка та відгук: кнопки «⭐ Оцінка» і «📝 Відгук» на головному екрані.\n"
             "• Якщо щось не працює: спробуйте повторити запит або відкрийте https://poweron.toe.com.ua/ вручну."
+        ]
+        if chat_id is not None and self.admin_user_id is not None and int(chat_id) == int(self.admin_user_id):
+            lines.insert(-1, "• Тест мапи світла Тернополя: кнопка «🗺 Мапа світла (Тернопіль)».\n")
+        return "".join(lines)
+
+    @staticmethod
+    def _ternopil_map_text() -> str:
+        return (
+            "🗺 Мапа наявності світла (Тернопіль):\n"
+            "https://svitlo.ternopil.webcam/\n\n"
+            "Що можна інтегрувати в бот із цього сервісу:\n"
+            "• Швидка кнопка відкриття карти (вже додано).\n"
+            "• Команда /map_ternopil для миттєвого доступу.\n"
+            "• Автосповіщення при зміні статусу по обраних районах (якщо сервіс надає API/стабільний feed).\n"
+            "• Теплова мапа/агрегація по районах у щоденному зведенні для адміна.\n"
+            "• Зв'язка з вашими автооновленнями графіків: повідомляти, коли за мапою є світло, а графік ще не оновився."
         )
 
     # ---------------------- data operations ----------------------
@@ -527,6 +612,44 @@ class PowerOnWizard:
             f"• Закріплених адрес: {len(self.pinned.get(chat_id, []))}"
         )
 
+    def _should_send_feedback_nudge(self, chat_id: int, now_ts: Optional[float] = None) -> bool:
+        self._ensure_user_loaded(chat_id)
+        now_ts = float(now_ts if now_ts is not None else time.time())
+        has_rating = self.has_user_rating(chat_id)
+        has_feedback = self.has_user_feedback(chat_id)
+        if has_rating and has_feedback:
+            return False
+
+        engagement = self.engagement.setdefault(chat_id, {"last_feedback_nudge_ts": 0})
+        last_nudge_ts = float(engagement.get("last_feedback_nudge_ts", 0) or 0)
+        if now_ts - last_nudge_ts < FEEDBACK_NUDGE_COOLDOWN_SECONDS:
+            return False
+
+        history_count = len(self.history.get(chat_id, []))
+        is_active = history_count >= ACTIVE_USER_HISTORY_THRESHOLD or bool(self.auto_update.get(chat_id, {}).get("enabled"))
+        if (not has_rating and not has_feedback) or is_active:
+            return True
+        return False
+
+    def _send_feedback_nudge_if_needed(self, chat_id: int):
+        if not self._should_send_feedback_nudge(chat_id):
+            return
+        has_rating = self.has_user_rating(chat_id)
+        has_feedback = self.has_user_feedback(chat_id)
+        if not has_rating and not has_feedback:
+            message = (
+                "🙏 Допоможіть покращити PowerON: поставте оцінку та залиште короткий відгук.\n"
+                "Натисніть «⭐ Оцінка» та «📝 Відгук» на головному екрані."
+            )
+        elif not has_rating:
+            message = "🙏 Ви активно користуєтесь ботом. Будемо вдячні за оцінку: «⭐ Оцінка»."
+        else:
+            message = "🙏 Ви активно користуєтесь ботом. Будемо вдячні за короткий відгук: «📝 Відгук»."
+
+        self.bot.send_message(chat_id, message, reply_markup=self._home_keyboard(chat_id))
+        self.engagement.setdefault(chat_id, {"last_feedback_nudge_ts": 0})["last_feedback_nudge_ts"] = time.time()
+        self._save_user_data(chat_id)
+
     def send_home(self, chat_id: int):
         self._ensure_user_loaded(chat_id)
         if chat_id not in self.seen_users:
@@ -538,12 +661,17 @@ class PowerOnWizard:
 
 Це сучасний бот для перевірки графіків відключень за вашою адресою.
 
-Натисніть «⚡ Перевірити графік», щоб почати пошук.""",
-                reply_markup=self._home_keyboard(),
+1) Натисніть «⚡ Перевірити графік».
+2) Оберіть населений пункт, вулицю, будинок.
+3) Отримайте скріншот та ГПВ.
+
+Порада: закріпіть адресу у «📌 Адреси» для швидкого доступу.""",
+                reply_markup=self._home_keyboard(chat_id),
             )
             return
 
-        self.bot.send_message(chat_id, "⚡ PowerON готовий. Оберіть дію нижче 👇", reply_markup=self._home_keyboard())
+        self.bot.send_message(chat_id, "⚡ PowerON готовий. Оберіть дію нижче 👇", reply_markup=self._home_keyboard(chat_id))
+        self._send_feedback_nudge_if_needed(chat_id)
 
     def send_settings(self, chat_id: int):
         self._ensure_user_loaded(chat_id)
@@ -589,11 +717,18 @@ class PowerOnWizard:
             return True
 
         if text in {"ℹ️ Статус", "📡 Статус"} or text.lower() == "/status":
-            self.bot.send_message(chat_id, self._status_text(chat_id), reply_markup=self._home_keyboard())
+            self.bot.send_message(chat_id, self._status_text(chat_id), reply_markup=self._home_keyboard(chat_id))
             return True
 
         if text.lower() in {"/faq", "faq"} or text in {"❓ FAQ"}:
-            self.bot.send_message(chat_id, self._faq_text(), reply_markup=self._home_keyboard())
+            self.bot.send_message(chat_id, self._faq_text(chat_id), reply_markup=self._home_keyboard(chat_id))
+            return True
+
+        if text in {"🗺 Мапа світла (Тернопіль)", "🗺 Мапа світла"} or text.lower() in {"/map_ternopil", "/ternopil_map", "/map"}:
+            if self.admin_user_id is None or int(chat_id) != int(self.admin_user_id):
+                self.bot.send_message(chat_id, "ℹ️ Функція мапи Тернополя тимчасово доступна лише адміну для тестування.")
+                return True
+            self.bot.send_message(chat_id, self._ternopil_map_text(), reply_markup=self._home_keyboard(chat_id))
             return True
 
         if text in {"⭐ Оцінити бота", "⭐ Оцінка"}:
@@ -626,11 +761,11 @@ class PowerOnWizard:
             user = getattr(message, "from_user", None)
             if self.has_user_rating(chat_id):
                 self.state.pop(chat_id, None)
-                self.bot.send_message(chat_id, "ℹ️ Ви вже залишили оцінку. Дякуємо!", reply_markup=self._home_keyboard())
+                self.bot.send_message(chat_id, "ℹ️ Ви вже залишили оцінку. Дякуємо!", reply_markup=self._home_keyboard(chat_id))
                 return True
             self.set_user_rating(chat_id, rating)
             self.state.pop(chat_id, None)
-            self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard())
+            self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard(chat_id))
             return True
 
         if session and session.get("step") == "feedback_input":
@@ -645,7 +780,7 @@ class PowerOnWizard:
                 first_name=getattr(user, "first_name", "") or "",
             )
             self.state.pop(chat_id, None)
-            self.bot.send_message(chat_id, "✅ Дякуємо за відгук!", reply_markup=self._home_keyboard())
+            self.bot.send_message(chat_id, "✅ Дякуємо за відгук!", reply_markup=self._home_keyboard(chat_id))
             return True
 
         if session and session.get("step") == "auto_interval_input":
@@ -787,7 +922,7 @@ class PowerOnWizard:
 
         if data.startswith("poweron:rate:"):
             if self.has_user_rating(chat_id):
-                self.bot.send_message(chat_id, "ℹ️ Ви вже залишили оцінку. Дякуємо!", reply_markup=self._home_keyboard())
+                self.bot.send_message(chat_id, "ℹ️ Ви вже залишили оцінку. Дякуємо!", reply_markup=self._home_keyboard(chat_id))
                 return True
             try:
                 rating = int(data.rsplit(":", 1)[1])
@@ -796,7 +931,7 @@ class PowerOnWizard:
             if rating < 1 or rating > 5:
                 return True
             self.set_user_rating(chat_id, rating)
-            self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard())
+            self.bot.send_message(chat_id, f"✅ Дякуємо! Вашу оцінку {rating}/5 збережено.", reply_markup=self._home_keyboard(chat_id))
             return True
 
         try:
@@ -982,6 +1117,8 @@ class PowerOnWizard:
                 continue
 
             interval = max(10, int(settings.get("interval", 60) or 60))
+            if self.feature_flags.get("degraded_mode"):
+                interval = max(interval, 120)
             settings["next_run_ts"] = now + interval
             self._schedule_auto_update(chat_id)
 
@@ -1155,6 +1292,7 @@ class PowerOnWizard:
         )
 
     def _send_schedule(self, chat_id: int, address_item: Optional[dict] = None, show_wait: bool = True):
+        started = time.time()
         self.metrics["schedule_requests"] += 1
         entry = self._build_entry_from_context(chat_id, address_item)
         try:
@@ -1175,6 +1313,7 @@ class PowerOnWizard:
             settings = self.auto_update.setdefault(chat_id, self._default_auto_update_settings())
             settings["last_signature"] = signature
             self._save_user_data(chat_id)
+            self._send_feedback_nudge_if_needed(chat_id)
         except PowerOnClientError as exc:
             self.metrics["schedule_failures"] += 1
             self.logger.warning("poweron.render_client_error chat_id=%s error=%s", chat_id, exc)
@@ -1183,6 +1322,8 @@ class PowerOnWizard:
             self.metrics["schedule_failures"] += 1
             self.logger.exception("poweron.render_failed chat_id=%s error=%s", chat_id, exc)
             self._send_text_fallback(chat_id, entry, (entry or {}).get("schedule", {}), reason="непередбачена помилка")
+        finally:
+            self._record_metric_latency("schedule_latencies_ms", int((time.time() - started) * 1000))
 
     def health_snapshot(self) -> dict:
         return {
