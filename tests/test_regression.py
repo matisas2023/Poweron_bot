@@ -172,9 +172,44 @@ class WizardFallbackTests(unittest.TestCase):
         self.assertEqual(wizard.metrics["text_fallbacks"], 1)
         self.assertGreaterEqual(len(wizard.metrics.get("schedule_latencies_ms", [])), 1)
 
-    def test_map_command_returns_ternopil_link(self):
+    def test_map_command_returns_ternopil_screenshot(self):
         bot = DummyBot()
         wizard = PowerOnWizard(bot, admin_user_id=77)
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(b"png")
+            fake_map_path = tmp.name
+
+        async def _fake_map(*args, **kwargs):
+            return fake_map_path
+
+        wizard.client.render_ternopil_map_screenshot = _fake_map
+        msg = type(
+            "Msg",
+            (),
+            {
+                "text": "/map_ternopil",
+                "chat": type("Chat", (), {"id": 77})(),
+                "from_user": type("User", (), {"id": 77, "username": "u", "first_name": "N"})(),
+            },
+        )()
+
+        try:
+            handled = wizard.handle_message(msg)
+            self.assertTrue(handled)
+            self.assertGreaterEqual(len(bot.photos), 1)
+            self.assertTrue(any("svitlo.ternopil.webcam" in (caption or "") for _, caption in bot.photos))
+        finally:
+            os.unlink(fake_map_path)
+
+    def test_map_command_falls_back_to_link_when_render_fails(self):
+        bot = DummyBot()
+        wizard = PowerOnWizard(bot, admin_user_id=77)
+
+        async def _raise_map(*args, **kwargs):
+            raise PowerOnClientError("boom")
+
+        wizard.client.render_ternopil_map_screenshot = _raise_map
         msg = type(
             "Msg",
             (),

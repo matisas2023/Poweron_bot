@@ -723,7 +723,7 @@ class PowerOnWizard:
             if self.admin_user_id is None or int(chat_id) != int(self.admin_user_id):
                 self.bot.send_message(chat_id, "ℹ️ Функція мапи Тернополя тимчасово доступна лише адміну для тестування.")
                 return True
-            self.bot.send_message(chat_id, self._ternopil_map_text(), reply_markup=self._home_keyboard(chat_id))
+            self._send_ternopil_map(chat_id)
             return True
 
         if text in {"⭐ Оцінити бота", "⭐ Оцінка"}:
@@ -1285,6 +1285,30 @@ class PowerOnWizard:
             f"• ГПВ: {schedule.get('gpv', '—')}",
             reply_markup=self._quick_access_keyboard(chat_id) or self._nav_keyboard(),
         )
+
+    def _send_ternopil_map(self, chat_id: int):
+        self.metrics["schedule_requests"] += 1
+        started = time.time()
+        try:
+            self.bot.send_message(chat_id, "⏳ Очікуйте, формую скрін мапи світла Тернополя...")
+            image_path = asyncio.run(self.client.render_ternopil_map_screenshot())
+            with open(image_path, "rb") as image_file:
+                self.bot.send_photo(
+                    chat_id,
+                    image_file,
+                    caption="🗺 Мапа наявності світла (Тернопіль) · джерело: svitlo.ternopil.webcam",
+                )
+            self.metrics["schedule_success"] += 1
+        except PowerOnClientError as exc:
+            self.metrics["schedule_failures"] += 1
+            self.logger.warning("poweron.ternopil_map_render_client_error chat_id=%s error=%s", chat_id, exc)
+            self.bot.send_message(chat_id, f"⚠️ Не вдалося сформувати скрін мапи. Відкрийте вручну: {self._ternopil_map_text()}")
+        except Exception as exc:
+            self.metrics["schedule_failures"] += 1
+            self.logger.exception("poweron.ternopil_map_render_failed chat_id=%s error=%s", chat_id, exc)
+            self.bot.send_message(chat_id, f"⚠️ Сталася помилка при формуванні мапи. Відкрийте вручну: {self._ternopil_map_text()}")
+        finally:
+            self._record_metric_latency("schedule_latencies_ms", int((time.time() - started) * 1000))
 
     def _send_schedule(self, chat_id: int, address_item: Optional[dict] = None, show_wait: bool = True):
         started = time.time()
