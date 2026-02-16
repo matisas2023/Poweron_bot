@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import os
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,7 +49,7 @@ class CacheRecord:
 
 
 class PowerOnClient:
-    def __init__(self, cache_dir: Optional[str] = None):
+    def __init__(self, cache_dir: Optional[str] = None, enable_periodic_cleanup: bool = True):
         from poweron_bot.paths import TMP_DIR
 
         default_cache_dir = TMP_DIR / "poweron"
@@ -57,6 +58,7 @@ class PowerOnClient:
         self._cache: Dict[str, CacheRecord] = {}
         self._locks: Dict[str, Tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
         self._last_cache_cleanup_ts = 0.0
+        self._cleanup_worker_started = False
         self.metrics = {
             "api_requests": 0,
             "api_failures": 0,
@@ -67,7 +69,34 @@ class PowerOnClient:
             "cache_misses": 0,
             "last_render_duration_ms": 0,
             "last_render_error": "",
+            "api_latencies_ms": [],
+            "render_latencies_ms": [],
+            "cache_cleanup_runs": 0,
+            "cache_files_deleted": 0,
         }
+        if enable_periodic_cleanup:
+            self._start_periodic_cache_cleanup_worker()
+
+    def _start_periodic_cache_cleanup_worker(self) -> None:
+        if self._cleanup_worker_started:
+            return
+        self._cleanup_worker_started = True
+        worker = threading.Thread(target=self._periodic_cache_cleanup_loop, name="poweron-cache-cleanup", daemon=True)
+        worker.start()
+
+    def _periodic_cache_cleanup_loop(self) -> None:
+        while True:
+            time.sleep(CACHE_CLEANUP_INTERVAL_SECONDS)
+            self._cleanup_cache_files()
+
+    def _record_latency(self, key: str, duration_ms: int, max_items: int = 200) -> None:
+        bucket = self.metrics.get(key)
+        if not isinstance(bucket, list):
+            bucket = []
+            self.metrics[key] = bucket
+        bucket.append(max(0, int(duration_ms)))
+        if len(bucket) > max_items:
+            del bucket[:-max_items]
 
     def _get_lock_for_current_loop(self, cache_key: str) -> asyncio.Lock:
         current_loop = asyncio.get_running_loop()
@@ -90,6 +119,7 @@ class PowerOnClient:
     async def _get_json(self, path: str, params: Optional[dict] = None) -> dict:
         last_error = None
         for attempt in range(1, API_RETRIES + 1):
+            started = time.time()
             self.metrics["api_requests"] += 1
             try:
                 if self._has_module("httpx"):
@@ -98,7 +128,9 @@ class PowerOnClient:
                     async with httpx.AsyncClient(base_url=BASE_API_URL, timeout=30.0) as client:
                         response = await client.get(path, params=params)
                         response.raise_for_status()
-                        return response.json()
+                        payload = response.json()
+                        self._record_latency("api_latencies_ms", int((time.time() - started) * 1000))
+                        return payload
 
                 if self._has_module("requests"):
                     import requests
@@ -108,7 +140,9 @@ class PowerOnClient:
                         response.raise_for_status()
                         return response.json()
 
-                    return await asyncio.to_thread(_request_sync)
+                    payload = await asyncio.to_thread(_request_sync)
+                    self._record_latency("api_latencies_ms", int((time.time() - started) * 1000))
+                    return payload
 
                 raise PowerOnClientError("Відсутній HTTP-клієнт. Встановіть httpx або requests.")
             except (TimeoutError, OSError) as exc:
@@ -117,6 +151,7 @@ class PowerOnClient:
                 last_error = exc
 
             self.metrics["api_failures"] += 1
+            self._record_latency("api_latencies_ms", int((time.time() - started) * 1000))
             if attempt < API_RETRIES:
                 await asyncio.sleep(0.5 * attempt)
 
@@ -187,11 +222,12 @@ class PowerOnClient:
                 break
         return result
 
-    def _cleanup_cache_files(self) -> None:
+    def _cleanup_cache_files(self, force: bool = False) -> int:
         now = time.time()
-        if now - self._last_cache_cleanup_ts < CACHE_CLEANUP_INTERVAL_SECONDS:
-            return
+        if not force and now - self._last_cache_cleanup_ts < CACHE_CLEANUP_INTERVAL_SECONDS:
+            return 0
         self._last_cache_cleanup_ts = now
+        removed_files = 0
 
         try:
             files = []
@@ -206,6 +242,7 @@ class PowerOnClient:
                 if now - mtime > CACHE_MAX_FILE_AGE_SECONDS:
                     try:
                         os.remove(path)
+                        removed_files += 1
                     except OSError:
                         pass
 
@@ -217,10 +254,17 @@ class PowerOnClient:
             for path, _ in files[CACHE_MAX_FILES:]:
                 try:
                     os.remove(path)
+                    removed_files += 1
                 except OSError:
                     pass
+            self.metrics["cache_cleanup_runs"] += 1
+            self.metrics["cache_files_deleted"] += removed_files
+            return removed_files
         except OSError:
-            return
+            return 0
+
+    def cleanup_cache_now(self) -> int:
+        return self._cleanup_cache_files(force=True)
 
     @staticmethod
     def _schedule_from_house_item(item: dict) -> dict:
@@ -274,13 +318,16 @@ class PowerOnClient:
                 started = time.time()
                 try:
                     await self._capture_from_site(settlement_name, street_name, house_name, image_path)
-                    self.metrics["last_render_duration_ms"] = int((time.time() - started) * 1000)
+                    render_duration_ms = int((time.time() - started) * 1000)
+                    self.metrics["last_render_duration_ms"] = render_duration_ms
+                    self._record_latency("render_latencies_ms", render_duration_ms)
                     self._cache[cache_key] = CacheRecord(path=image_path, expires_at=time.time() + CACHE_TTL_SECONDS)
                     return image_path
                 except (PowerOnRenderError, TimeoutError, OSError) as exc:
                     last_error = exc
                     self.metrics["last_render_error"] = str(exc)
                     self.metrics["render_failures"] += 1
+                    self._record_latency("render_latencies_ms", int((time.time() - started) * 1000))
                     if attempt < CAPTURE_RETRIES:
                         await asyncio.sleep(0.75 * attempt)
 
