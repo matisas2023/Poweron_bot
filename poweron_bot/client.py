@@ -67,7 +67,18 @@ class PowerOnClient:
             "cache_misses": 0,
             "last_render_duration_ms": 0,
             "last_render_error": "",
+            "api_latencies_ms": [],
+            "render_latencies_ms": [],
         }
+
+    def _record_latency(self, key: str, duration_ms: int, max_items: int = 200) -> None:
+        bucket = self.metrics.get(key)
+        if not isinstance(bucket, list):
+            bucket = []
+            self.metrics[key] = bucket
+        bucket.append(max(0, int(duration_ms)))
+        if len(bucket) > max_items:
+            del bucket[:-max_items]
 
     def _get_lock_for_current_loop(self, cache_key: str) -> asyncio.Lock:
         current_loop = asyncio.get_running_loop()
@@ -90,6 +101,7 @@ class PowerOnClient:
     async def _get_json(self, path: str, params: Optional[dict] = None) -> dict:
         last_error = None
         for attempt in range(1, API_RETRIES + 1):
+            started = time.time()
             self.metrics["api_requests"] += 1
             try:
                 if self._has_module("httpx"):
@@ -98,7 +110,9 @@ class PowerOnClient:
                     async with httpx.AsyncClient(base_url=BASE_API_URL, timeout=30.0) as client:
                         response = await client.get(path, params=params)
                         response.raise_for_status()
-                        return response.json()
+                        payload = response.json()
+                        self._record_latency("api_latencies_ms", int((time.time() - started) * 1000))
+                        return payload
 
                 if self._has_module("requests"):
                     import requests
@@ -108,7 +122,9 @@ class PowerOnClient:
                         response.raise_for_status()
                         return response.json()
 
-                    return await asyncio.to_thread(_request_sync)
+                    payload = await asyncio.to_thread(_request_sync)
+                    self._record_latency("api_latencies_ms", int((time.time() - started) * 1000))
+                    return payload
 
                 raise PowerOnClientError("Відсутній HTTP-клієнт. Встановіть httpx або requests.")
             except (TimeoutError, OSError) as exc:
@@ -117,6 +133,7 @@ class PowerOnClient:
                 last_error = exc
 
             self.metrics["api_failures"] += 1
+            self._record_latency("api_latencies_ms", int((time.time() - started) * 1000))
             if attempt < API_RETRIES:
                 await asyncio.sleep(0.5 * attempt)
 
@@ -274,13 +291,16 @@ class PowerOnClient:
                 started = time.time()
                 try:
                     await self._capture_from_site(settlement_name, street_name, house_name, image_path)
-                    self.metrics["last_render_duration_ms"] = int((time.time() - started) * 1000)
+                    render_duration_ms = int((time.time() - started) * 1000)
+                    self.metrics["last_render_duration_ms"] = render_duration_ms
+                    self._record_latency("render_latencies_ms", render_duration_ms)
                     self._cache[cache_key] = CacheRecord(path=image_path, expires_at=time.time() + CACHE_TTL_SECONDS)
                     return image_path
                 except (PowerOnRenderError, TimeoutError, OSError) as exc:
                     last_error = exc
                     self.metrics["last_render_error"] = str(exc)
                     self.metrics["render_failures"] += 1
+                    self._record_latency("render_latencies_ms", int((time.time() - started) * 1000))
                     if attempt < CAPTURE_RETRIES:
                         await asyncio.sleep(0.75 * attempt)
 
