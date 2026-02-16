@@ -25,7 +25,7 @@ class DummyBot:
 class ClientTests(unittest.TestCase):
     def test_cache_cleanup_removes_old_files(self):
         with tempfile.TemporaryDirectory() as tmp:
-            client = PowerOnClient(cache_dir=tmp)
+            client = PowerOnClient(cache_dir=tmp, enable_periodic_cleanup=False)
             old_path = os.path.join(tmp, "old.png")
             with open(old_path, "wb") as f:
                 f.write(b"x")
@@ -36,6 +36,7 @@ class ClientTests(unittest.TestCase):
             client._last_cache_cleanup_ts = 0
             client._cleanup_cache_files()
             self.assertFalse(os.path.exists(old_path))
+            self.assertGreaterEqual(client.metrics.get("cache_cleanup_runs", 0), 1)
 
     def test_browser_candidates_prefers_env_path(self):
         old = os.environ.get("POWERON_BROWSER_PATH")
@@ -51,7 +52,7 @@ class ClientTests(unittest.TestCase):
                 os.environ["POWERON_BROWSER_PATH"] = old
 
     def test_fetch_house_schedule_returns_target_house(self):
-        client = PowerOnClient(cache_dir=tempfile.mkdtemp())
+        client = PowerOnClient(cache_dir=tempfile.mkdtemp(), enable_periodic_cleanup=False)
 
         async def _fake_get_json(self, path, params=None):
             assert path == "/pw_houses"
@@ -71,7 +72,7 @@ class ClientTests(unittest.TestCase):
 
     def test_render_schedule_force_refresh_bypasses_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
-            client = PowerOnClient(cache_dir=tmp)
+            client = PowerOnClient(cache_dir=tmp, enable_periodic_cleanup=False)
             cache_key = "1:2:3"
             image_path = os.path.join(tmp, "cached.png")
             with open(image_path, "wb") as f:

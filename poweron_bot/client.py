@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import os
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,7 +49,7 @@ class CacheRecord:
 
 
 class PowerOnClient:
-    def __init__(self, cache_dir: Optional[str] = None):
+    def __init__(self, cache_dir: Optional[str] = None, enable_periodic_cleanup: bool = True):
         from poweron_bot.paths import TMP_DIR
 
         default_cache_dir = TMP_DIR / "poweron"
@@ -57,6 +58,7 @@ class PowerOnClient:
         self._cache: Dict[str, CacheRecord] = {}
         self._locks: Dict[str, Tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
         self._last_cache_cleanup_ts = 0.0
+        self._cleanup_worker_started = False
         self.metrics = {
             "api_requests": 0,
             "api_failures": 0,
@@ -69,7 +71,32 @@ class PowerOnClient:
             "last_render_error": "",
             "api_latencies_ms": [],
             "render_latencies_ms": [],
+            "cache_cleanup_runs": 0,
+            "cache_files_deleted": 0,
         }
+        if enable_periodic_cleanup:
+            self._start_periodic_cache_cleanup_worker()
+
+    def _start_periodic_cache_cleanup_worker(self) -> None:
+        if self._cleanup_worker_started:
+            return
+        self._cleanup_worker_started = True
+        worker = threading.Thread(target=self._periodic_cache_cleanup_loop, name="poweron-cache-cleanup", daemon=True)
+        worker.start()
+
+    def _periodic_cache_cleanup_loop(self) -> None:
+        while True:
+            time.sleep(CACHE_CLEANUP_INTERVAL_SECONDS)
+            self._cleanup_cache_files()
+
+    def _record_latency(self, key: str, duration_ms: int, max_items: int = 200) -> None:
+        bucket = self.metrics.get(key)
+        if not isinstance(bucket, list):
+            bucket = []
+            self.metrics[key] = bucket
+        bucket.append(max(0, int(duration_ms)))
+        if len(bucket) > max_items:
+            del bucket[:-max_items]
 
     def _record_latency(self, key: str, duration_ms: int, max_items: int = 200) -> None:
         bucket = self.metrics.get(key)
@@ -209,6 +236,7 @@ class PowerOnClient:
         if now - self._last_cache_cleanup_ts < CACHE_CLEANUP_INTERVAL_SECONDS:
             return
         self._last_cache_cleanup_ts = now
+        removed_files = 0
 
         try:
             files = []
@@ -223,6 +251,7 @@ class PowerOnClient:
                 if now - mtime > CACHE_MAX_FILE_AGE_SECONDS:
                     try:
                         os.remove(path)
+                        removed_files += 1
                     except OSError:
                         pass
 
@@ -234,8 +263,11 @@ class PowerOnClient:
             for path, _ in files[CACHE_MAX_FILES:]:
                 try:
                     os.remove(path)
+                    removed_files += 1
                 except OSError:
                     pass
+            self.metrics["cache_cleanup_runs"] += 1
+            self.metrics["cache_files_deleted"] += removed_files
         except OSError:
             return
 
