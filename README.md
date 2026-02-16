@@ -123,7 +123,7 @@ python -m compileall poweron_bot
 - `/logs_tail` — швидкий перегляд останніх рядків логів прямо в Telegram.
 - `/feature_flags` — керування функціоналом без деплою (інлайн-меню з перемикачами + `/feature_flags <name> <on|off>`).
 - Кнопка `🚨 Інцидент` в адмін-меню: health + швидка чистка кешу + короткий tail логів.
-- Кнопка `🗺 Мапа світла (Тернопіль)` + команда `/map_ternopil` для переходу на мапу: https://svitlo.ternopil.webcam/ (тимчасово лише для адміна, для тестування).
+- Кнопка `🗺 Мапа світла (Тернопіль)` + команда `/map_ternopil` надсилає скрін мапи з https://svitlo.ternopil.webcam/ для всіх користувачів.
 - Автооновлення для вибраних користувачем адрес (до 6).
 - Перехід на SQLite storage (`data/users.sqlite`) для стабільнішого збереження станів.
 - Кеш має policy через ENV: `POWERON_CACHE_MAX_FILES`, `POWERON_CACHE_MAX_FILE_AGE_SECONDS`, `POWERON_CACHE_LOW_DISK_FREE_MB`.

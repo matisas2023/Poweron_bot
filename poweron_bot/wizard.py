@@ -335,8 +335,7 @@ class PowerOnWizard:
             types.KeyboardButton("📡 Статус"),
             types.KeyboardButton("❓ FAQ"),
         )
-        if chat_id is not None and self.admin_user_id is not None and int(chat_id) == int(self.admin_user_id):
-            kb.add(types.KeyboardButton("🗺 Мапа світла (Тернопіль)"))
+        kb.add(types.KeyboardButton("🗺 Мапа світла (Тернопіль)"))
         kb.add(
             types.KeyboardButton("⭐ Оцінка"),
             types.KeyboardButton("📝 Відгук"),
@@ -542,8 +541,7 @@ class PowerOnWizard:
             "• Де дивитись карту світла в Тернополі? Натисніть «🗺 Мапа світла (Тернопіль)».\n"
             "• Якщо щось не працює: спробуйте повторити запит або відкрийте https://poweron.toe.com.ua/ вручну."
         ]
-        if chat_id is not None and self.admin_user_id is not None and int(chat_id) == int(self.admin_user_id):
-            lines.insert(-1, "• Тест мапи світла Тернополя: кнопка «🗺 Мапа світла (Тернопіль)».\n")
+        lines.insert(-1, "• Мапа світла Тернополя: кнопка «🗺 Мапа світла (Тернопіль)».\n")
         return "".join(lines)
 
     @staticmethod
@@ -720,9 +718,6 @@ class PowerOnWizard:
             return True
 
         if text in {"🗺 Мапа світла (Тернопіль)", "🗺 Мапа світла"} or text.lower() in {"/map_ternopil", "/ternopil_map", "/map"}:
-            if self.admin_user_id is None or int(chat_id) != int(self.admin_user_id):
-                self.bot.send_message(chat_id, "ℹ️ Функція мапи Тернополя тимчасово доступна лише адміну для тестування.")
-                return True
             self._send_ternopil_map(chat_id)
             return True
 

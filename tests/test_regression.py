@@ -133,7 +133,7 @@ class WizardFallbackTests(unittest.TestCase):
         home_count = sum(1 for row in kb.keyboard for btn in row if (btn.get("text") if isinstance(btn, dict) else "") == "🏠 Додому")
         self.assertEqual(home_count, 1)
         map_count = sum(1 for row in kb.keyboard for btn in row if (btn.get("text") if isinstance(btn, dict) else "") == "🗺 Мапа світла (Тернопіль)")
-        self.assertEqual(map_count, 0)
+        self.assertEqual(map_count, 1)
 
     def test_home_keyboard_shows_admin_panel_only_for_admin(self):
         bot = DummyBot()
@@ -151,7 +151,7 @@ class WizardFallbackTests(unittest.TestCase):
         admin_map = any((btn.get("text") if isinstance(btn, dict) else "") == "🗺 Мапа світла (Тернопіль)" for row in admin_kb.keyboard for btn in row)
         regular_map = any((btn.get("text") if isinstance(btn, dict) else "") == "🗺 Мапа світла (Тернопіль)" for row in regular_kb.keyboard for btn in row)
         self.assertTrue(admin_map)
-        self.assertFalse(regular_map)
+        self.assertTrue(regular_map)
 
     def test_send_schedule_falls_back_to_text(self):
         bot = DummyBot()
@@ -224,9 +224,18 @@ class WizardFallbackTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertTrue(any("svitlo.ternopil.webcam" in text for _, text in bot.messages))
 
-    def test_map_command_for_non_admin_returns_testing_notice(self):
+    def test_map_command_for_non_admin_returns_ternopil_screenshot(self):
         bot = DummyBot()
         wizard = PowerOnWizard(bot, admin_user_id=77)
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(b"png")
+            fake_map_path = tmp.name
+
+        async def _fake_map(*args, **kwargs):
+            return fake_map_path
+
+        wizard.client.render_ternopil_map_screenshot = _fake_map
         msg = type(
             "Msg",
             (),
@@ -237,9 +246,12 @@ class WizardFallbackTests(unittest.TestCase):
             },
         )()
 
-        handled = wizard.handle_message(msg)
-        self.assertTrue(handled)
-        self.assertTrue(any("лише адміну" in text.lower() for _, text in bot.messages))
+        try:
+            handled = wizard.handle_message(msg)
+            self.assertTrue(handled)
+            self.assertGreaterEqual(len(bot.photos), 1)
+        finally:
+            os.unlink(fake_map_path)
 
     def test_build_entry_refreshes_schedule_from_api(self):
         bot = DummyBot()
